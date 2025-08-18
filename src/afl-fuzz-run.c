@@ -5,12 +5,12 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com> and
                         Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@
 #endif
 
 #include "cmplog.h"
+#include "asanfuzz.h"
 
 #ifdef PROFILING
 u64 time_spent_working = 0;
@@ -41,8 +42,9 @@ u64 time_spent_working = 0;
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update afl->fsrv->trace_bits. */
 
-fsrv_run_result_t __attribute__((hot))
-fuzz_run_target(afl_state_t *afl, afl_forkserver_t *fsrv, u32 timeout) {
+fsrv_run_result_t __attribute__((hot)) fuzz_run_target(afl_state_t      *afl,
+                                                       afl_forkserver_t *fsrv,
+                                                       u32 timeout) {
 
 #ifdef PROFILING
   static u64      time_spent_start = 0;
@@ -60,6 +62,44 @@ fuzz_run_target(afl_state_t *afl, afl_forkserver_t *fsrv, u32 timeout) {
 
   fsrv_run_result_t res = afl_fsrv_run_target(fsrv, timeout, &afl->stop_soon);
 
+#ifdef __AFL_CODE_COVERAGE
+  if (unlikely(!fsrv->persistent_trace_bits)) {
+
+    // On the first run, we allocate the persistent map to collect coverage.
+    fsrv->persistent_trace_bits = (u8 *)malloc(fsrv->map_size);
+    memset(fsrv->persistent_trace_bits, 0, fsrv->map_size);
+
+  }
+
+  for (u32 i = 0; i < fsrv->map_size; ++i) {
+
+    if (fsrv->persistent_trace_bits[i] != 255 && fsrv->trace_bits[i]) {
+
+      fsrv->persistent_trace_bits[i]++;
+
+    }
+
+  }
+
+#endif
+
+  /* If post_run() function is defined in custom mutator, the function will be
+     called each time after AFL++ executes the target program. */
+
+  if (unlikely(afl->custom_mutators_count)) {
+
+    LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+      if (unlikely(el->afl_custom_post_run)) {
+
+        el->afl_custom_post_run(el->data);
+
+      }
+
+    });
+
+  }
+
 #ifdef PROFILING
   clock_gettime(CLOCK_REALTIME, &spec);
   time_spent_start = (spec.tv_sec * 1000000000) + spec.tv_nsec;
@@ -73,8 +113,8 @@ fuzz_run_target(afl_state_t *afl, afl_forkserver_t *fsrv, u32 timeout) {
    old file is unlinked and a new one is created. Otherwise, afl->fsrv.out_fd is
    rewound and truncated. */
 
-u32 __attribute__((hot))
-write_to_testcase(afl_state_t *afl, void **mem, u32 len, u32 fix) {
+u32 __attribute__((hot)) write_to_testcase(afl_state_t *afl, void **mem,
+                                           u32 len, u32 fix) {
 
   u8 sent = 0;
 
@@ -133,32 +173,66 @@ write_to_testcase(afl_state_t *afl, void **mem, u32 len, u32 fix) {
 
     }
 
-    if (new_mem != *mem) { *mem = new_mem; }
+    if (new_mem != *mem && new_mem != NULL && new_size > 0) {
 
-    if (unlikely(afl->custom_mutators_count)) {
+      new_buf = afl_realloc(AFL_BUF_PARAM(out_scratch), new_size);
+      if (unlikely(!new_buf)) { PFATAL("alloc"); }
+      memcpy(new_buf, new_mem, new_size);
 
-      LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+      /* if AFL_POST_PROCESS_KEEP_ORIGINAL is set then save the original memory
+         prior post-processing in new_mem to restore it later */
+      if (unlikely(afl->afl_env.afl_post_process_keep_original)) {
 
-        if (el->afl_custom_fuzz_send) {
+        new_mem = *mem;
+
+      }
+
+      *mem = new_buf;
+      afl_swap_bufs(AFL_BUF_PARAM(out), AFL_BUF_PARAM(out_scratch));
+
+    }
+
+    LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+      if (el->afl_custom_fuzz_send) {
+
+        if (!afl->afl_env.afl_custom_mutator_late_send) {
 
           el->afl_custom_fuzz_send(el->data, *mem, new_size);
-          sent = 1;
+
+        } else {
+
+          afl->fsrv.custom_input = *mem;
+          afl->fsrv.custom_input_len = new_size;
 
         }
 
-      });
+        sent = 1;
 
-    }
+      }
+
+    });
 
     if (likely(!sent)) {
 
       /* everything as planned. use the potentially new data. */
       afl_fsrv_write_to_testcase(&afl->fsrv, *mem, new_size);
-      len = new_size;
 
     }
 
-  } else {
+    if (likely(!afl->afl_env.afl_post_process_keep_original)) {
+
+      len = new_size;
+
+    } else {
+
+      /* restore the original memory which was saved in new_mem */
+      *mem = new_mem;
+      afl_swap_bufs(AFL_BUF_PARAM(out), AFL_BUF_PARAM(out_scratch));
+
+    }
+
+  } else {                                   /* !afl->custom_mutators_count */
 
     if (unlikely(len < afl->min_length && !fix)) {
 
@@ -170,27 +244,8 @@ write_to_testcase(afl_state_t *afl, void **mem, u32 len, u32 fix) {
 
     }
 
-    if (unlikely(afl->custom_mutators_count)) {
-
-      LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
-
-        if (el->afl_custom_fuzz_send) {
-
-          el->afl_custom_fuzz_send(el->data, *mem, len);
-          sent = 1;
-
-        }
-
-      });
-
-    }
-
-    if (likely(!sent)) {
-
-      /* boring uncustom. */
-      afl_fsrv_write_to_testcase(&afl->fsrv, *mem, len);
-
-    }
+    /* boring uncustom. */
+    afl_fsrv_write_to_testcase(&afl->fsrv, *mem, len);
 
   }
 
@@ -387,6 +442,7 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
   u32 use_tmout = afl->fsrv.exec_tmout;
   u8 *old_sn = afl->stage_name;
 
+  u64 calibration_start_us = get_cur_time_us();
   if (unlikely(afl->shm.cmplog_mode)) { q->exec_cksum = 0; }
 
   /* Be a bit more generous about timeouts when resuming sessions, or when
@@ -431,6 +487,10 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
     }
 
   }
+
+  u8 saved_afl_post_process_keep_original =
+      afl->afl_env.afl_post_process_keep_original;
+  afl->afl_env.afl_post_process_keep_original = 1;
 
   /* we need a dummy run if this is LTO + cmplog */
   if (unlikely(afl->shm.cmplog_mode)) {
@@ -482,6 +542,10 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
     fault = fuzz_run_target(afl, &afl->fsrv, use_tmout);
 
+    // update the time spend in calibration after each execution, as those may
+    // be slow
+    update_calibration_time(afl, &calibration_start_us);
+
     /* afl->stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
 
@@ -523,16 +587,16 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
         }
 
-        if (unlikely(!var_detected)) {
+        if (unlikely(!var_detected && !afl->afl_env.afl_no_warn_instability)) {
 
           // note: from_queue seems to only be set during initialization
           if (afl->afl_env.afl_no_ui || from_queue) {
 
-            WARNF("instability detected during calibration");
+            WARNF("instability detected during calibration: %s", q->fname);
 
           } else if (afl->debug) {
 
-            DEBUGF("instability detected during calibration\n");
+            DEBUGF("instability detected during calibration: %s\n", q->fname);
 
           }
 
@@ -579,6 +643,8 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
   }
 
   q->exec_us = diff_us / afl->stage_max;
+  if (unlikely(!q->exec_us)) { q->exec_us = 1; }
+
   q->bitmap_size = count_bytes(afl, afl->fsrv.trace_bits);
   q->handicap = handicap;
   q->cal_failed = 0;
@@ -586,7 +652,7 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
   afl->total_bitmap_size += q->bitmap_size;
   ++afl->total_bitmap_entries;
 
-  update_bitmap_score(afl, q);
+  update_bitmap_score(afl, q, true);
 
   /* If this case didn't result in new output from the instrumentation, tell
      parent. This is a non-critical problem, but something to warn the user
@@ -599,6 +665,9 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
   }
 
 abort_calibration:
+
+  afl->afl_env.afl_post_process_keep_original =
+      saved_afl_post_process_keep_original;
 
   if (new_bits == 2 && !q->has_new_cov) {
 
@@ -613,12 +682,7 @@ abort_calibration:
 
     afl->var_byte_count = count_bytes(afl, afl->var_bytes);
 
-    if (!q->var_behavior) {
-
-      mark_as_variable(afl, q);
-      ++afl->queued_variable;
-
-    }
+    if (!q->var_behavior) { ++afl->queued_variable; }
 
   }
 
@@ -628,6 +692,7 @@ abort_calibration:
 
   if (!first_run) { show_stats(afl); }
 
+  update_calibration_time(afl, &calibration_start_us);
   return fault;
 
 }
@@ -635,6 +700,8 @@ abort_calibration:
 /* Grab interesting test cases from other fuzzers. */
 
 void sync_fuzzers(afl_state_t *afl) {
+
+  if (unlikely(afl->afl_env.afl_no_sync)) { return; }
 
   DIR           *sd;
   struct dirent *sd_ent;
@@ -647,10 +714,15 @@ void sync_fuzzers(afl_state_t *afl) {
   afl->stage_max = afl->stage_cur = 0;
   afl->cur_depth = 0;
 
+  u64 sync_start_us = get_cur_time_us();
   /* Look at the entries created for every other fuzzer in the sync directory.
    */
 
   while ((sd_ent = readdir(sd))) {
+
+    // since sync can take substantial amounts of time, update time spend every
+    // iteration
+    update_sync_time(afl, &sync_start_us);
 
     u8  qd_synced_path[PATH_MAX], qd_path[PATH_MAX];
     u32 min_accept = 0, next_min_accept = 0;
@@ -738,6 +810,8 @@ void sync_fuzzers(afl_state_t *afl) {
     afl->stage_cur = 0;
     afl->stage_max = 0;
 
+    show_stats(afl);
+
     /* For every file queued by this fuzzer, parse ID and see if we have
        looked at it before; exec a test case if not. */
 
@@ -789,15 +863,22 @@ void sync_fuzzers(afl_state_t *afl) {
         /* See what happens. We rely on save_if_interesting() to catch major
            errors and save the test case. */
 
-        (void)write_to_testcase(afl, (void **)&mem, st.st_size, 1);
+        u32 new_len = write_to_testcase(afl, (void **)&mem, st.st_size, 1);
 
         fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
 
-        if (afl->stop_soon) { goto close_sync; }
+        if (afl->stop_soon) {
+
+          munmap(mem, st.st_size);
+          close(fd);
+
+          goto close_sync;
+
+        }
 
         afl->syncing_party = sd_ent->d_name;
-        afl->queued_imported +=
-            save_if_interesting(afl, mem, st.st_size, fault);
+        afl->queued_imported += save_if_interesting(afl, mem, new_len, fault);
+        show_stats(afl);
         afl->syncing_party = 0;
 
         munmap(mem, st.st_size);
@@ -839,6 +920,9 @@ void sync_fuzzers(afl_state_t *afl) {
 
   if (afl->foreign_sync_cnt) read_foreign_testcases(afl, 0);
 
+  // add time in sync one last time
+  update_sync_time(afl, &sync_start_us);
+
   afl->last_sync_time = get_cur_time();
   afl->last_sync_cycle = afl->queue_cycle;
 
@@ -850,8 +934,9 @@ void sync_fuzzers(afl_state_t *afl) {
 
 u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
+  u8  needs_write = 0, fault = 0;
   u32 orig_len = q->len;
-
+  u64 trim_start_us = get_cur_time_us();
   /* Custom mutator trimmer */
   if (afl->custom_mutators_count) {
 
@@ -875,11 +960,15 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
     }
 
-    if (custom_trimmed) return trimmed_case;
+    if (custom_trimmed) {
+
+      fault = trimmed_case;
+      goto abort_trimming;
+
+    }
 
   }
 
-  u8  needs_write = 0, fault = 0;
   u32 trim_exec = 0;
   u32 remove_len;
   u32 len_p2;
@@ -890,7 +979,12 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
      detected, it will still work to some extent, so we don't check for
      this. */
 
-  if (q->len < 5) { return 0; }
+  if (unlikely(q->len < 5)) {
+
+    fault = 0;
+    goto abort_trimming;
+
+  }
 
   afl->stage_name = afl->stage_name_buf;
   afl->bytes_trim_in += q->len;
@@ -924,6 +1018,8 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
       fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
 
+      update_trim_time(afl, &trim_start_us);
+
       if (afl->stop_soon || fault == FSRV_RUN_ERROR) { goto abort_trimming; }
 
       /* Note that we don't keep track of crashes or hangs here; maybe TODO?
@@ -950,7 +1046,6 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
         /* Let's save a clean trace, which will be needed by
            update_bitmap_score once we're done with the trimming stuff. */
-
         if (!needs_write) {
 
           needs_write = 1;
@@ -965,7 +1060,6 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
       }
 
       /* Since this can be slow, update the screen every now and then. */
-
       if (!(trim_exec++ % afl->stats_update_freq)) { show_stats(afl); }
       ++afl->stage_cur;
 
@@ -979,6 +1073,68 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
      version of the test case. */
 
   if (needs_write) {
+
+    // run afl_custom_post_process
+
+    if (unlikely(afl->custom_mutators_count) &&
+        likely(!afl->afl_env.afl_post_process_keep_original)) {
+
+      ssize_t new_size = q->len;
+      u8     *new_mem = in_buf;
+      u8     *new_buf = NULL;
+
+      LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+        if (el->afl_custom_post_process) {
+
+          new_size = el->afl_custom_post_process(el->data, new_mem, new_size,
+                                                 &new_buf);
+
+          if (unlikely(!new_buf || new_size <= 0)) {
+
+            new_size = 0;
+            new_buf = new_mem;
+
+          } else {
+
+            new_mem = new_buf;
+
+          }
+
+        }
+
+      });
+
+      if (unlikely(!new_size)) {
+
+        new_size = q->len;
+        new_mem = in_buf;
+
+      }
+
+      if (unlikely(new_size < afl->min_length)) {
+
+        new_size = afl->min_length;
+
+      } else if (unlikely(new_size > afl->max_length)) {
+
+        new_size = afl->max_length;
+
+      }
+
+      q->len = new_size;
+
+      if (new_mem != in_buf && new_mem != NULL) {
+
+        new_buf = afl_realloc(AFL_BUF_PARAM(out_scratch), new_size);
+        if (unlikely(!new_buf)) { PFATAL("alloc"); }
+        memcpy(new_buf, new_mem, new_size);
+
+        in_buf = new_buf;
+
+      }
+
+    }
 
     s32 fd;
 
@@ -1012,13 +1168,14 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
     queue_testcase_retake_mem(afl, q, in_buf, q->len, orig_len);
 
     memcpy(afl->fsrv.trace_bits, afl->clean_trace, afl->fsrv.map_size);
-    update_bitmap_score(afl, q);
+    update_bitmap_score(afl, q, true);
 
   }
 
 abort_trimming:
-
   afl->bytes_trim_out += q->len;
+  update_trim_time(afl, &trim_start_us);
+
   return fault;
 
 }
@@ -1027,8 +1184,8 @@ abort_trimming:
    error conditions, returning 1 if it's time to bail out. This is
    a helper function for fuzz_one(). */
 
-u8 __attribute__((hot))
-common_fuzz_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
+u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
+                                          u32 len) {
 
   u8 fault;
 

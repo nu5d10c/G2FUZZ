@@ -5,12 +5,12 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>,
                      Andrea Fioraldi <andreafioraldi@gmail.com>,
                      Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@ u32  check_binary_signatures(u8 *fn);
 void detect_file_args(char **argv, u8 *prog_in, bool *use_stdin);
 void print_suggested_envs(char *mispelled_env);
 void check_environment_vars(char **env);
+void set_sanitizer_defaults();
 
 char **argv_cpy_dup(int argc, char **argv);
 void   argv_cpy_free(char **argv);
@@ -75,8 +76,9 @@ u8 *find_afl_binary(u8 *own_loc, u8 *fname);
 int parse_afl_kill_signal(u8 *numeric_signal_as_str, int default_signal);
 
 /* Configure the signals that are used to kill the forkserver
-   and the forked childs. If `afl_kill_signal_env` or `afl_fsrv_kill_signal_env`
-   is NULL, the appropiate values are read from the environment. */
+   and the forked children. If `afl_kill_signal_env` or
+   `afl_fsrv_kill_signal_env` is NULL, the appropriate values are read from the
+   environment. */
 void configure_afl_kill_signals(afl_forkserver_t *fsrv,
                                 char             *afl_kill_signal_env,
                                 char             *afl_fsrv_kill_signal_env,
@@ -114,6 +116,11 @@ u8 *stringify_mem_size(u8 *buf, size_t len, u64 val);
 
 u8 *stringify_time_diff(u8 *buf, size_t len, u64 cur_ms, u64 event_ms);
 
+/* Unsafe describe time delta as simple string.
+   Returns a pointer to buf for convenience. */
+
+u8 *u_simplestring_time_diff(u8 *buf, u64 cur_ms, u64 event_ms);
+
 /* Unsafe Describe integer. The buf sizes are not checked.
    This is unsafe but fast.
    Will return buf for convenience. */
@@ -141,6 +148,16 @@ FILE *create_ffile(u8 *fn);
 
 /* create a file */
 s32 create_file(u8 *fn);
+
+/* memmem implementation as not all platforms support this */
+void *afl_memmem(const void *haystack, size_t haystacklen, const void *needle,
+                 size_t needlelen);
+
+#ifdef __linux__
+/* Nyx helper functions to create and remove tmp workdirs */
+char *create_nyx_tmp_workdir(void);
+void  remove_nyx_tmp_workdir(afl_forkserver_t *fsrv, char *nyx_out_dir_path);
+#endif
 
 #endif
 

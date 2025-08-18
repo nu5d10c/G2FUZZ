@@ -11,7 +11,7 @@
 # from Laszlo Szekeres.
 #
 # Copyright 2015 Google Inc. All rights reserved.
-# Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+# Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,15 +28,17 @@ MAN_PATH    ?= $(PREFIX)/share/man/man8
 
 VERSION     = $(shell grep '^$(HASH)define VERSION ' ./config.h | cut -d '"' -f2)
 
-CFLAGS          ?= -O3 -g -funroll-loops -D_FORTIFY_SOURCE=1
+CFLAGS          ?= -O3 -g -funroll-loops
+# -D_FORTIFY_SOURCE=1
 CFLAGS_SAFE     := -Wall -Iinclude -Wno-pointer-sign \
                    -DAFL_PATH=\"$(HELPER_PATH)\" -DBIN_PATH=\"$(BIN_PATH)\" \
                    -DGCC_VERSION=\"$(GCCVER)\" -DGCC_BINDIR=\"$(GCCBINDIR)\" \
                    -Wno-unused-function
 override CFLAGS += $(CFLAGS_SAFE)
 
-CXXFLAGS    ?= -O3 -g -funroll-loops -D_FORTIFY_SOURCE=1
-CXXEFLAGS   := $(CXXFLAGS) -Wall -std=c++11
+CXXFLAGS    ?= -O3 -g -funroll-loops
+# -D_FORTIFY_SOURCE=1
+CXXEFLAGS   := $(CXXFLAGS) $(CPPFLAGS) -Wall -std=c++11
 
 CC          ?= gcc
 CXX         ?= g++
@@ -59,7 +61,7 @@ ifeq "$(findstring Foundation,$(shell $(CC) --version))" ""
 endif
 
 PLUGIN_BASE = "$(shell $(CC) -print-file-name=plugin)"
-PLUGIN_FLAGS = -fPIC -fno-rtti -I$(PLUGIN_BASE)/include -I$(PLUGIN_BASE)
+PLUGIN_FLAGS = -fPIC -fno-rtti -fno-exceptions -I$(PLUGIN_BASE)/include -I$(PLUGIN_BASE)
 HASH=\#
 
 GCCVER    = $(shell $(CC) --version 2>/dev/null | awk 'NR == 1 {print $$NF}')
@@ -161,7 +163,7 @@ $(PASSES): instrumentation/afl-gcc-common.h
 .PHONY: test_build
 test_build: $(PROGS)
 	@echo "[*] Testing the CC wrapper and instrumentation output..."
-	unset AFL_USE_ASAN AFL_USE_MSAN; ASAN_OPTIONS=detect_leaks=0 AFL_QUIET=1 AFL_INST_RATIO=100 AFL_PATH=. AFL_CC=$(CC) ./afl-gcc-fast $(CFLAGS) $(CPPFLAGS) ./test-instr.c -o test-instr $(LDFLAGS)
+	unset AFL_USE_ASAN AFL_USE_MSAN AFL_LLVM_ALLOWLIST AFL_LLVM_DENYLIST; ASAN_OPTIONS=detect_leaks=0 AFL_QUIET=1 AFL_INST_RATIO=100 AFL_PATH=. AFL_CC=$(CC) ./afl-gcc-fast $(CFLAGS) $(CPPFLAGS) ./test-instr.c -o test-instr $(LDFLAGS)
 	ASAN_OPTIONS=detect_leaks=0 ./afl-showmap -m none -q -o .test-instr0 ./test-instr </dev/null
 	echo 1 | ASAN_OPTIONS=detect_leaks=0 ./afl-showmap -m none -q -o .test-instr1 ./test-instr
 	@rm -f test-instr
@@ -175,7 +177,7 @@ all_done: test_build
 .NOTPARALLEL: clean
 
 %.8: %
-	@echo .TH $* 8 `date "+%Y-%m-%d"` "afl++" > ./$@
+	@echo .TH $* 8 `date "+%Y-%m-%d"` "AFL++" > ./$@
 	@echo .SH NAME >> ./$@
 	@echo .B $* >> ./$@
 	@echo >> ./$@
@@ -187,8 +189,8 @@ all_done: test_build
 	@./$* -h 2>&1 | tail -n +4 >> ./$@
 	@echo >> ./$@
 	@echo .SH AUTHOR >> ./$@
-	@echo "afl++ was written by Michal \"lcamtuf\" Zalewski and is maintained by Marc \"van Hauser\" Heuse <mh@mh-sec.de>, Heiko \"hexcoder-\" Eissfeldt <heiko.eissfeldt@hexco.de>, Andrea Fioraldi <andreafioraldi@gmail.com> and Dominik Maier <domenukk@gmail.com>" >> ./$@
-	@echo  The homepage of afl++ is: https://github.com/AFLplusplus/AFLplusplus >> ./$@
+	@echo "AFL++ was written by Michal \"lcamtuf\" Zalewski and is maintained by Marc \"van Hauser\" Heuse <mh@mh-sec.de>, Dominik Maier <domenukk@gmail.com>, Andrea Fioraldi <andreafioraldi@gmail.com> and Heiko \"hexcoder-\" Eissfeldt <heiko.eissfeldt@hexco.de>" >> ./$@
+	@echo  The homepage of AFL++ is: https://github.com/AFLplusplus/AFLplusplus >> ./$@
 	@echo >> ./$@
 	@echo .SH LICENSE >> ./$@
 	@echo Apache License Version 2.0, January 2004 >> ./$@

@@ -4,7 +4,7 @@
 
    Written by Marc Heuse <mh@mh-sec.de>
 
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -53,7 +53,9 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#if LLVM_VERSION_MAJOR < 17
+  #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#endif
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -118,12 +120,17 @@ llvmGetPassPluginInfo() {
   #if LLVM_VERSION_MAJOR <= 13
             using OptimizationLevel = typename PassBuilder::OptimizationLevel;
   #endif
-            PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel OL) {
+            PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM,
+                                                  OptimizationLevel  OL
+  #if LLVM_VERSION_MAJOR >= 20
+                                                  ,
+                                                  ThinOrFullLTOPhase Phase
+  #endif
+                                               ) {
 
-                  MPM.addPass(AFLdict2filePass());
+              MPM.addPass(AFLdict2filePass());
 
-                });
+            });
 
           }};
 
@@ -182,7 +189,7 @@ bool AFLdict2filePass::runOnModule(Module &M) {
 
   DenseMap<Value *, std::string *> valueMap;
   char                            *ptr;
-  int                              found = 0;
+  int                              found = 0, handle_main = 1;
 
   /* Show a banner */
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -192,15 +199,30 @@ bool AFLdict2filePass::runOnModule(Module &M) {
     SAYF(cCYA "afl-llvm-dict2file" VERSION cRST
               " by Marc \"vanHauser\" Heuse <mh@mh-sec.de>\n");
 
-  } else
+  } else {
 
     be_quiet = 1;
+
+  }
+
+  if (getenv("AFL_LLVM_DICT2FILE_NO_MAIN")) { handle_main = 0; }
 
   scanForDangerousFunctions(&M);
 
   ptr = getenv("AFL_LLVM_DICT2FILE");
 
-  if (!ptr || *ptr != '/')
+  if (!ptr) {
+
+#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+    auto PA = PreservedAnalyses::all();
+    return PA;
+#else
+    return true;
+#endif
+
+  }
+
+  if (*ptr != '/')
     FATAL("AFL_LLVM_DICT2FILE is not set to an absolute path: %s", ptr);
 
   of.open(ptr, std::ofstream::out | std::ofstream::app);
@@ -210,7 +232,14 @@ bool AFLdict2filePass::runOnModule(Module &M) {
 
   for (auto &F : M) {
 
-    if (isIgnoreFunction(&F)) continue;
+    if (!handle_main &&
+        (!F.getName().compare("main") || !F.getName().compare("_main"))) {
+
+      continue;
+
+    }
+
+    if (isIgnoreFunction(&F)) { continue; }
     if (!isInInstrumentList(&F, MNAME) || !F.size()) { continue; }
 
     /*  Some implementation notes.
@@ -409,32 +438,35 @@ bool AFLdict2filePass::runOnModule(Module &M) {
           isStrstr &=
               FT->getNumParams() == 2 &&
               FT->getParamType(0) == FT->getParamType(1) &&
-              FT->getParamType(0) == IntegerType::getInt8PtrTy(M.getContext());
+              FT->getParamType(0) ==
+                  IntegerType::getInt8Ty(M.getContext())->getPointerTo(0);
           isStrcmp &=
               FT->getNumParams() == 2 && FT->getReturnType()->isIntegerTy(32) &&
               FT->getParamType(0) == FT->getParamType(1) &&
-              FT->getParamType(0) == IntegerType::getInt8PtrTy(M.getContext());
+              FT->getParamType(0) ==
+                  IntegerType::getInt8Ty(M.getContext())->getPointerTo(0);
           isStrcasecmp &=
               FT->getNumParams() == 2 && FT->getReturnType()->isIntegerTy(32) &&
               FT->getParamType(0) == FT->getParamType(1) &&
-              FT->getParamType(0) == IntegerType::getInt8PtrTy(M.getContext());
+              FT->getParamType(0) ==
+                  IntegerType::getInt8Ty(M.getContext())->getPointerTo(0);
           isMemcmp &= FT->getNumParams() == 3 &&
                       FT->getReturnType()->isIntegerTy(32) &&
                       FT->getParamType(0)->isPointerTy() &&
                       FT->getParamType(1)->isPointerTy() &&
                       FT->getParamType(2)->isIntegerTy();
-          isStrncmp &= FT->getNumParams() == 3 &&
-                       FT->getReturnType()->isIntegerTy(32) &&
-                       FT->getParamType(0) == FT->getParamType(1) &&
-                       FT->getParamType(0) ==
-                           IntegerType::getInt8PtrTy(M.getContext()) &&
-                       FT->getParamType(2)->isIntegerTy();
-          isStrncasecmp &= FT->getNumParams() == 3 &&
-                           FT->getReturnType()->isIntegerTy(32) &&
-                           FT->getParamType(0) == FT->getParamType(1) &&
-                           FT->getParamType(0) ==
-                               IntegerType::getInt8PtrTy(M.getContext()) &&
-                           FT->getParamType(2)->isIntegerTy();
+          isStrncmp &=
+              FT->getNumParams() == 3 && FT->getReturnType()->isIntegerTy(32) &&
+              FT->getParamType(0) == FT->getParamType(1) &&
+              FT->getParamType(0) ==
+                  IntegerType::getInt8Ty(M.getContext())->getPointerTo(0) &&
+              FT->getParamType(2)->isIntegerTy();
+          isStrncasecmp &=
+              FT->getNumParams() == 3 && FT->getReturnType()->isIntegerTy(32) &&
+              FT->getParamType(0) == FT->getParamType(1) &&
+              FT->getParamType(0) ==
+                  IntegerType::getInt8Ty(M.getContext())->getPointerTo(0) &&
+              FT->getParamType(2)->isIntegerTy();
           isStdString &= FT->getNumParams() >= 2 &&
                          FT->getParamType(0)->isPointerTy() &&
                          FT->getParamType(1)->isPointerTy();
@@ -634,6 +666,13 @@ bool AFLdict2filePass::runOnModule(Module &M) {
             Value       *op2 = callInst->getArgOperand(2);
             ConstantInt *ilen = dyn_cast<ConstantInt>(op2);
 
+            if (!ilen) {
+
+              op2 = callInst->getArgOperand(1);
+              ilen = dyn_cast<ConstantInt>(op2);
+
+            }
+
             if (ilen) {
 
               uint64_t literalLength = optLen;
@@ -719,7 +758,7 @@ bool AFLdict2filePass::runOnModule(Module &M) {
   auto PA = PreservedAnalyses::all();
   return PA;
 #else
-  return true;
+  return false;
 #endif
 
 }
@@ -733,7 +772,7 @@ static void registerAFLdict2filePass(const PassManagerBuilder &,
 }
 
 static RegisterPass<AFLdict2filePass> X("afl-dict2file",
-                                        "afl++ dict2file instrumentation pass",
+                                        "AFL++ dict2file instrumentation pass",
                                         false, false);
 
 static RegisterStandardPasses RegisterAFLdict2filePass(

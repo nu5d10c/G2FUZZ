@@ -7,12 +7,12 @@
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>,
                      Andrea Fioraldi <andreafioraldi@gmail.com>,
                      Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -51,6 +51,7 @@ typedef struct sharedmem {
   size_t map_size;                                 /* actual allocated size */
 
   int             cmplog_mode;
+  int             sanfuzz_mode;
   int             shmemfuzz_mode;
   struct cmp_map *cmp_map;
 

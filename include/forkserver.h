@@ -7,12 +7,12 @@
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>,
                      Andrea Fioraldi <andreafioraldi@gmail.com>,
                      Dominik Maier <mail@dmnk.co>>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ typedef enum NyxReturnValue {
   Normal,
   Crash,
   Asan,
-  Timout,
+  Timeout,
   InvalidWriteToPayload,
   Error,
   IoError,
@@ -51,16 +51,28 @@ typedef enum NyxReturnValue {
 
 } NyxReturnValue;
 
+typedef enum NyxProcessRole {
+
+  StandAlone,
+  Parent,
+  Child,
+
+} NyxProcessRole;
+
 typedef struct {
 
-  void *(*nyx_new)(const char *sharedir, const char *workdir, uint32_t cpu_id,
-                   uint32_t input_buffer_size,
-                   bool     input_buffer_write_protection);
-  void *(*nyx_new_parent)(const char *sharedir, const char *workdir,
-                          uint32_t cpu_id, uint32_t input_buffer_size,
-                          bool input_buffer_write_protection);
-  void *(*nyx_new_child)(const char *sharedir, const char *workdir,
-                         uint32_t cpu_id, uint32_t worker_id);
+  void *(*nyx_config_load)(const char *sharedir);
+  void (*nyx_config_set_workdir_path)(void *config, const char *workdir);
+  void (*nyx_config_set_input_buffer_size)(void    *config,
+                                           uint32_t input_buffer_size);
+  void (*nyx_config_set_input_buffer_write_protection)(
+      void *config, bool input_buffer_write_protection);
+  void (*nyx_config_set_hprintf_fd)(void *config, int32_t hprintf_fd);
+  void (*nyx_config_set_process_role)(void *config, enum NyxProcessRole role);
+  void (*nyx_config_set_reuse_snapshot_path)(void       *config,
+                                             const char *reuse_snapshot_path);
+
+  void *(*nyx_new)(void *config, uint32_t worker_id);
   void (*nyx_shutdown)(void *qemu_process);
   void (*nyx_option_set_reload_mode)(void *qemu_process, bool enable);
   void (*nyx_option_set_timeout)(void *qemu_process, uint8_t timeout_sec,
@@ -73,8 +85,18 @@ typedef struct {
   uint32_t (*nyx_get_aux_string)(void *nyx_process, uint8_t *buffer,
                                  uint32_t size);
 
+  bool (*nyx_remove_work_dir)(const char *workdir);
+  bool (*nyx_config_set_aux_buffer_size)(void    *config,
+                                         uint32_t aux_buffer_size);
+
+  uint64_t (*nyx_get_target_hash64)(void *config);
+
+  void (*nyx_config_free)(void *config);
+
 } nyx_plugin_handler_t;
 
+/* Imports helper functions to enable Nyx mode (Linux only )*/
+nyx_plugin_handler_t *afl_load_libnyx_plugin(u8 *libnyx_binary);
 #endif
 
 typedef struct afl_forkserver {
@@ -107,12 +129,15 @@ typedef struct afl_forkserver {
   u8 *out_file,                         /* File to fuzz, if any             */
       *target_path;                     /* Path of the target               */
 
-  FILE *plot_file;                      /* Gnuplot output file              */
+  FILE *plot_file,                      /* Gnuplot output file              */
+      *det_plot_file;
 
   /* Note: last_run_timed_out is u32 to send it to the child as 4 byte array */
   u32 last_run_timed_out;               /* Traced process timed out?        */
 
   u8 last_kill_signal;                  /* Signal that killed the child     */
+
+  u8 last_exit_code;               /* Child exit code if counted as a crash */
 
   bool use_shmem_fuzz;                  /* use shared mem for test cases    */
 
@@ -132,9 +157,12 @@ typedef struct afl_forkserver {
 
   bool no_unlink;                       /* do not unlink cur_input          */
 
-  bool uses_asan;                       /* Target uses ASAN?                */
+  u8 uses_asan;     /* Target uses ASAN/LSAN/MSAN? (bit 0/1/2 respectively) */
 
   bool debug;                           /* debug mode?                      */
+
+  u8 san_but_not_instrumented; /* Is it sanitizer enabled but not instrumented?
+                                */
 
   bool uses_crash_exitcode;             /* Custom crash exitcode specified? */
   u8   crash_exitcode;                  /* The crash exitcode specified     */
@@ -144,6 +172,7 @@ typedef struct afl_forkserver {
   u8 *shmem_fuzz;                       /* allocated memory for fuzzing     */
 
   char *cmplog_binary;                  /* the name of the cmplog binary    */
+  char *asanfuzz_binary;                /* the name of the ASAN binary      */
 
   /* persistent mode replay functionality */
   u32 persistent_record;                /* persistent replay setting        */
@@ -168,6 +197,8 @@ typedef struct afl_forkserver {
 
   u8 persistent_mode;
 
+  u32 max_length;
+
 #ifdef __linux__
   nyx_plugin_handler_t *nyx_handlers;
   char                 *out_dir_path;    /* path to the output directory     */
@@ -178,7 +209,21 @@ typedef struct afl_forkserver {
   u32                   nyx_id;          /* nyx runner id (0 -> master)      */
   u32                   nyx_bind_cpu_id; /* nyx runner cpu id                */
   char                 *nyx_aux_string;
+  u32                   nyx_aux_string_len;
+  bool                  nyx_use_tmp_workdir;
+  char                 *nyx_tmp_workdir_path;
+  s32                   nyx_log_fd;
+  u64                   nyx_target_hash64;
 #endif
+
+#ifdef __AFL_CODE_COVERAGE
+  u8 *persistent_trace_bits;                   /* Persistent copy of bitmap */
+#endif
+
+  void *custom_data_ptr;
+  u8   *custom_input;
+  u32   custom_input_len;
+  void (*late_send)(void *, const u8 *, size_t);
 
 } afl_forkserver_t;
 
@@ -205,6 +250,10 @@ fsrv_run_result_t afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
 void              afl_fsrv_killall(void);
 void              afl_fsrv_deinit(afl_forkserver_t *fsrv);
 void              afl_fsrv_kill(afl_forkserver_t *fsrv);
+
+#ifdef __linux__
+void nyx_load_target_hash(afl_forkserver_t *fsrv);
+#endif
 
 #ifdef __APPLE__
   #define MSG_FORK_ON_APPLE                                                    \

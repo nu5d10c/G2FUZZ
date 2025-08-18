@@ -5,12 +5,12 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
-                     Andrea Fioraldi <andreafioraldi@gmail.com>,
                      Dominik Maier <mail@dmnk.co>
+                     Andrea Fioraldi <andreafioraldi@gmail.com>,
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>,
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@
 /* Version string: */
 
 // c = release, a = volatile github dev, e = experimental branch
-#define VERSION "++4.05c"
+#define VERSION "++4.32c"
 
 /******************************************************
  *                                                    *
@@ -39,12 +39,42 @@
    However if a target has problematic constructors and init arrays then
    this can fail. Hence afl-fuzz deploys a larger default map. The largest
    map seen so far is the xlsx fuzzer for libreoffice which is 5MB.
-   At runtime this value can be overriden via AFL_MAP_SIZE.
+   At runtime this value can be overridden via AFL_MAP_SIZE.
    Default: 8MB (defined in bytes) */
 #define DEFAULT_SHMEM_SIZE (8 * 1024 * 1024)
 
+/* Default time until when no more coverage finds are happening afl-fuzz
+   switches to exploitation mode. It automatically switches back when new
+   coverage is found.
+   Default: 300 (seconds) */
+#define STRATEGY_SWITCH_TIME 1000
+
 /* Default file permission umode when creating files (default: 0600) */
 #define DEFAULT_PERMISSION 0600
+
+#ifdef __APPLE__
+  #include <TargetConditionals.h>
+  #if TARGET_OS_IOS
+    #undef DEFAULT_PERMISSION
+    #define DEFAULT_PERMISSION 0666
+  #endif
+#endif
+#ifdef __ANDROID__
+  #undef DEFAULT_PERMISSION
+  #define DEFAULT_PERMISSION 0666
+#endif
+
+/* SkipDet's global configuration */
+
+#define MINIMAL_BLOCK_SIZE 64
+#define SMALL_DET_TIME (60 * 1000 * 1000U)
+#define MAXIMUM_INF_EXECS (16 * 1024U)
+#define MAXIMUM_QUICK_EFF_EXECS (64 * 1024U)
+#define THRESHOLD_DEC_TIME (20 * 60 * 1000U)
+
+/* Set the Prob of selecting eff_bytes 3 times more than original,
+   Now disabled */
+#define EFF_HAVOC_RATE 3
 
 /* CMPLOG/REDQUEEN TUNING
  *
@@ -54,10 +84,6 @@
  *
  */
 
-/* if TRANSFORM is enabled with '-l T', this additionally enables base64
-   encoding/decoding */
-// #define CMPLOG_SOLVE_TRANSFORM_BASE64
-
 /* If a redqueen pass finds more than one solution, try to combine them? */
 #define CMPLOG_COMBINE
 
@@ -65,23 +91,34 @@
 #define CMPLOG_CORPUS_PERCENT 5U
 
 /* Number of potential positions from which we decide if cmplog becomes
-   useless, default 8096 */
+   useless, default 12288 */
 #define CMPLOG_POSITIONS_MAX (12 * 1024)
 
-/* Maximum allowed fails per CMP value. Default: 128 */
+/* Maximum allowed fails per CMP value. Default: 96 */
 #define CMPLOG_FAIL_MAX 96
+
+/*
+ * Effective fuzzing with selective feeding inputs
+ */
+
+#define MAX_EXTRA_SAN_BINARY 4
 
 /* -------------------------------------*/
 /* Now non-cmplog configuration options */
 /* -------------------------------------*/
 
-/* If a persistent target keeps state and found crashes are not reproducable
+/* If a persistent target keeps state and found crashes are not reproducible
    then enable this option and set the AFL_PERSISTENT_RECORD env variable
    to a number. These number of testcases prior and including the crash case
    will be kept and written to the crash/ directory as RECORD:... files.
    Note that every crash will be written, not only unique ones! */
 
-//#define AFL_PERSISTENT_RECORD
+// #define AFL_PERSISTENT_RECORD
+
+/* Adds support in compiler-rt to replay persistent records in @@-style
+ * harnesses */
+
+//  #define AFL_PERSISTENT_REPLAY_ARGPARSE
 
 /* console output colors: There are three ways to configure its behavior
  * 1. default: colored outputs fixed on: defined USE_COLOR && defined
@@ -118,9 +155,9 @@
 
 // #define _WANT_ORIGINAL_AFL_ALLOC
 
-/* Comment out to disable fancy ANSI boxes and use poor man's 7-bit UI: */
+/* Comment out to disable fancy boxes and use poor man's 7-bit UI: */
 
-#ifndef ANDROID_DISABLE_FANCY  // Fancy boxes are ugly from adb
+#ifndef DISABLE_FANCY
   #define FANCY_BOXES
 #endif
 
@@ -134,7 +171,8 @@
 #define EXEC_TM_ROUND 20U
 
 /* 64bit arch MACRO */
-#if (defined(__x86_64__) || defined(__arm64__) || defined(__aarch64__))
+#if (defined(__x86_64__) || defined(__arm64__) || defined(__aarch64__) || \
+     (defined(__riscv) && __riscv_xlen == 64))
   #define WORD_SIZE_64 1
 #endif
 
@@ -163,8 +201,8 @@
 
 /* Maximum number of unique hangs or crashes to record: */
 
-#define KEEP_UNIQUE_HANG 500U
-#define KEEP_UNIQUE_CRASH 10000U
+#define KEEP_UNIQUE_HANG 512U
+#define KEEP_UNIQUE_CRASH 25600U
 
 /* Baseline number of random tweaks during a single 'havoc' stage: */
 
@@ -305,9 +343,9 @@
 #define SYNC_INTERVAL 8
 
 /* Sync time (minimum time between syncing in ms, time is halfed for -M main
-   nodes) - default is 30 minutes: */
+   nodes) - default is 20 minutes: */
 
-#define SYNC_TIME (30 * 60 * 1000)
+#define SYNC_TIME (20 * 60 * 1000)
 
 /* Output directory reuse grace period (minutes): */
 
@@ -354,9 +392,10 @@
       65535,      /* Overflow unsig 16-bit when incremented  */ \
       65536,      /* Overflow unsig 16 bit                   */ \
       100663045,  /* Large positive number (endian-agnostic) */ \
+      2139095040, /* float infinite                          */ \
       2147483647                 /* Overflow signed 32-bit when incremented */
 
-#define INTERESTING_32_LEN 8
+#define INTERESTING_32_LEN 9
 
 /***********************************************************
  *                                                         *
@@ -364,9 +403,9 @@
  *                                                         *
  ***********************************************************/
 
-/* Call count interval between reseeding the libc PRNG from /dev/urandom: */
+/* Call count interval between reseeding the PRNG from /dev/urandom: */
 
-#define RESEED_RNG 100000
+#define RESEED_RNG 2500000
 
 /* The default maximum testcase cache size in MB, 0 = disable.
    A value between 50 and 250 is a good default value. Note that the
@@ -440,7 +479,15 @@
    after changing this - otherwise, SEGVs may ensue. */
 
 #define MAP_SIZE_POW2 16
+
+/* Do not change this unless you really know what you are doing. */
+
 #define MAP_SIZE (1U << MAP_SIZE_POW2)
+#if MAP_SIZE <= 2097152
+  #define MAP_INITIAL_SIZE (2 << 20)  // = 2097152
+#else
+  #define MAP_INITIAL_SIZE MAP_SIZE
+#endif
 
 /* Maximum allocator request size (keep well under INT_MAX): */
 
@@ -463,6 +510,9 @@
 /* AFL RedQueen */
 
 #define CMPLOG_SHM_ENV_VAR "__AFL_CMPLOG_SHM_ID"
+
+/* ASAN SHM ID */
+#define AFL_ASAN_FUZZ_SHM_ENV_VAR "__AFL_ASAN_SHM_ID"
 
 /* CPU Affinity lockfile env var */
 
@@ -491,10 +541,14 @@
 
 #define AFL_TXT_MIN_LEN 12
 
-/* What is the minimum percentage of ascii characters present to be classifed
+/* Maximum length of a queue input to be evaluated for "is_ascii"? */
+
+#define AFL_TXT_MAX_LEN 65535
+
+/* What is the minimum percentage of ascii characters present to be classified
    as "is_ascii"? */
 
-#define AFL_TXT_MIN_PERCENT 94
+#define AFL_TXT_MIN_PERCENT 99
 
 /* How often to perform ASCII mutations 0 = disable, 1-8 are good values */
 

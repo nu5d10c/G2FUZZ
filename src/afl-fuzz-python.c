@@ -5,11 +5,11 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ static void *unsupported(afl_state_t *afl, unsigned int seed) {
 
 }
 
-  /* sorry for this makro...
+  /* sorry for this macro...
   it just fills in `&py_mutator->something_buf, &py_mutator->something_size`. */
   #define BUF_PARAMS(name) (void **)&((py_mutator_t *)py_mutator)->name##_buf
 
@@ -219,20 +219,67 @@ static py_mutator_t *init_py_module(afl_state_t *afl, u8 *module_name) {
 
   if (py_module != NULL) {
 
-    u8 py_notrim = 0, py_idx;
-    /* init, required */
+    u8 py_notrim = 0;
+  #if PY_MINOR_VERSION > 12 || PY_MAJOR_VERSION > 3
+    PyObject_GetOptionalAttrString(py_module, "init",
+                                   &py_functions[PY_FUNC_INIT]);
+  #else
     py_functions[PY_FUNC_INIT] = PyObject_GetAttrString(py_module, "init");
-    if (!py_functions[PY_FUNC_INIT])
-      FATAL("init function not found in python module");
+  #endif
+    if (!py_functions[PY_FUNC_INIT]) {
+
+      WARNF("init function not found in python module");
+
+    }
+
+  #if PY_MINOR_VERSION > 12 || PY_MAJOR_VERSION > 3
+    PyObject_GetOptionalAttrString(py_module, "fuzz",
+                                   &py_functions[PY_FUNC_FUZZ]);
+  #else
     py_functions[PY_FUNC_FUZZ] = PyObject_GetAttrString(py_module, "fuzz");
+  #endif
+  #if PY_MINOR_VERSION > 12 || PY_MAJOR_VERSION > 3
+    if (!py_functions[PY_FUNC_FUZZ])
+      PyObject_GetOptionalAttrString(py_module, "mutate",
+                                     &py_functions[PY_FUNC_FUZZ]);
+    PyObject_GetOptionalAttrString(py_module, "describe",
+                                   &py_functions[PY_FUNC_DESCRIBE]);
+    PyObject_GetOptionalAttrString(py_module, "fuzz_count",
+                                   &py_functions[PY_FUNC_FUZZ_COUNT]);
+    PyObject_GetOptionalAttrString(py_module, "post_process",
+                                   &py_functions[PY_FUNC_POST_PROCESS]);
+    PyObject_GetOptionalAttrString(py_module, "init_trim",
+                                   &py_functions[PY_FUNC_INIT_TRIM]);
+    PyObject_GetOptionalAttrString(py_module, "post_trim",
+                                   &py_functions[PY_FUNC_POST_TRIM]);
+    PyObject_GetOptionalAttrString(py_module, "trim",
+                                   &py_functions[PY_FUNC_TRIM]);
+    PyObject_GetOptionalAttrString(py_module, "havoc_mutation",
+                                   &py_functions[PY_FUNC_HAVOC_MUTATION]);
+    PyObject_GetOptionalAttrString(
+        py_module, "havoc_mutation_probability",
+        &py_functions[PY_FUNC_HAVOC_MUTATION_PROBABILITY]);
+    PyObject_GetOptionalAttrString(py_module, "queue_get",
+                                   &py_functions[PY_FUNC_QUEUE_GET]);
+    PyObject_GetOptionalAttrString(py_module, "fuzz_send",
+                                   &py_functions[PY_FUNC_FUZZ_SEND]);
+    PyObject_GetOptionalAttrString(py_module, "post_run",
+                                   &py_functions[PY_FUNC_POST_RUN]);
+    PyObject_GetOptionalAttrString(py_module, "splice_optout",
+                                   &py_functions[PY_FUNC_SPLICE_OPTOUT]);
+    PyObject_GetOptionalAttrString(py_module, "queue_new_entry",
+                                   &py_functions[PY_FUNC_QUEUE_NEW_ENTRY]);
+    PyObject_GetOptionalAttrString(py_module, "introspection",
+                                   &py_functions[PY_FUNC_INTROSPECTION]);
+    PyObject_GetOptionalAttrString(py_module, "deinit",
+                                   &py_functions[PY_FUNC_DEINIT]);
+  #else
     if (!py_functions[PY_FUNC_FUZZ])
       py_functions[PY_FUNC_FUZZ] = PyObject_GetAttrString(py_module, "mutate");
     py_functions[PY_FUNC_DESCRIBE] =
         PyObject_GetAttrString(py_module, "describe");
     py_functions[PY_FUNC_FUZZ_COUNT] =
         PyObject_GetAttrString(py_module, "fuzz_count");
-    if (!py_functions[PY_FUNC_FUZZ])
-      WARNF("fuzz function not found in python module");
     py_functions[PY_FUNC_POST_PROCESS] =
         PyObject_GetAttrString(py_module, "post_process");
     py_functions[PY_FUNC_INIT_TRIM] =
@@ -248,43 +295,19 @@ static py_mutator_t *init_py_module(afl_state_t *afl, u8 *module_name) {
         PyObject_GetAttrString(py_module, "queue_get");
     py_functions[PY_FUNC_FUZZ_SEND] =
         PyObject_GetAttrString(py_module, "fuzz_send");
+    py_functions[PY_FUNC_POST_RUN] =
+        PyObject_GetAttrString(py_module, "post_run");
+    py_functions[PY_FUNC_SPLICE_OPTOUT] =
+        PyObject_GetAttrString(py_module, "splice_optout");
     py_functions[PY_FUNC_QUEUE_NEW_ENTRY] =
         PyObject_GetAttrString(py_module, "queue_new_entry");
     py_functions[PY_FUNC_INTROSPECTION] =
         PyObject_GetAttrString(py_module, "introspection");
     py_functions[PY_FUNC_DEINIT] = PyObject_GetAttrString(py_module, "deinit");
+  #endif
+    if (py_functions[PY_FUNC_SPLICE_OPTOUT]) { afl->custom_splice_optout = 1; }
     if (!py_functions[PY_FUNC_DEINIT])
       WARNF("deinit function not found in python module");
-
-    for (py_idx = 0; py_idx < PY_FUNC_COUNT; ++py_idx) {
-
-      if (!py_functions[py_idx] || !PyCallable_Check(py_functions[py_idx])) {
-
-        if (py_idx >= PY_FUNC_INIT_TRIM && py_idx <= PY_FUNC_TRIM) {
-
-          // Implementing the trim API is optional for now
-          if (PyErr_Occurred()) { PyErr_Print(); }
-          py_notrim = 1;
-
-        } else if (py_idx >= PY_OPTIONAL) {
-
-          // Only _init and _deinit are not optional currently
-
-          if (PyErr_Occurred()) { PyErr_Print(); }
-
-        } else {
-
-          fprintf(stderr,
-                  "Cannot find/call function with index %d in external "
-                  "Python module.\n",
-                  py_idx);
-          return NULL;
-
-        }
-
-      }
-
-    }
 
     if (py_notrim) {
 
@@ -337,6 +360,8 @@ static void init_py(afl_state_t *afl, py_mutator_t *py_mutator,
                     unsigned int seed) {
 
   (void)afl;
+
+  if (py_mutator->py_functions[PY_FUNC_INIT] == NULL) { return; }
 
   PyObject *py_args, *py_value;
 
@@ -394,15 +419,33 @@ void deinit_py(void *py_mutator) {
 
 }
 
+void splice_optout_py(void *py_mutator) {
+
+  // this is never called
+  (void)(py_mutator);
+
+}
+
 struct custom_mutator *load_custom_mutator_py(afl_state_t *afl,
                                               char        *module_name) {
 
   struct custom_mutator *mutator;
 
   mutator = ck_alloc(sizeof(struct custom_mutator));
-
   mutator->name = module_name;
   ACTF("Loading Python mutator library from '%s'...", module_name);
+
+  if (memchr(module_name, '/', strlen(module_name))) {
+
+    mutator->name_short = strdup(strrchr(module_name, '/') + 1);
+
+  } else {
+
+    mutator->name_short = strdup(module_name);
+
+  }
+
+  if (strlen(mutator->name_short) > 22) { mutator->name_short[21] = 0; }
 
   py_mutator_t *py_mutator;
   py_mutator = init_py_module(afl, module_name);
@@ -471,6 +514,19 @@ struct custom_mutator *load_custom_mutator_py(afl_state_t *afl,
   if (py_functions[PY_FUNC_FUZZ_SEND]) {
 
     mutator->afl_custom_fuzz_send = fuzz_send_py;
+
+  }
+
+  if (py_functions[PY_FUNC_POST_RUN]) {
+
+    mutator->afl_custom_post_run = post_run_py;
+
+  }
+
+  if (py_functions[PY_FUNC_SPLICE_OPTOUT]) {
+
+    mutator->afl_custom_splice_optout = splice_optout_py;
+    afl->custom_splice_optout = 1;
 
   }
 
@@ -921,6 +977,28 @@ void fuzz_send_py(void *py_mutator, const u8 *buf, size_t buf_size) {
   Py_DECREF(py_args);
 
   if (py_value != NULL) { Py_DECREF(py_value); }
+
+}
+
+void post_run_py(void *py_mutator) {
+
+  PyObject *py_args, *py_value;
+
+  py_args = PyTuple_New(0);
+  py_value = PyObject_CallObject(
+      ((py_mutator_t *)py_mutator)->py_functions[PY_FUNC_POST_RUN], py_args);
+  Py_DECREF(py_args);
+
+  if (py_value != NULL) {
+
+    Py_DECREF(py_value);
+
+  } else {
+
+    PyErr_Print();
+    FATAL("Call failed");
+
+  }
 
 }
 

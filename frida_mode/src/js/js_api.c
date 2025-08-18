@@ -156,6 +156,13 @@ __attribute__((visibility("default"))) void js_api_set_instrument_instructions(
 
 }
 
+__attribute__((visibility("default"))) void
+js_api_set_instrument_no_dynamic_load(void) {
+
+  ranges_inst_dynamic_load = FALSE;
+
+}
+
 __attribute__((visibility("default"))) void js_api_set_instrument_no_optimize(
     void) {
 
@@ -289,6 +296,13 @@ __attribute__((visibility("default"))) void js_api_set_instrument_cache_size(
 
 }
 
+__attribute__((visibility("default"))) void
+js_api_set_instrument_suppress_disable(void) {
+
+  instrument_suppress = false;
+
+}
+
 __attribute__((visibility("default"))) void js_api_set_js_main_hook(
     const js_main_hook_t hook) {
 
@@ -299,6 +313,12 @@ __attribute__((visibility("default"))) void js_api_set_js_main_hook(
 __attribute__((visibility("default"))) void js_api_set_verbose(void) {
 
   util_verbose = TRUE;
+
+}
+
+__attribute__((visibility("default"))) void js_api_ijon_set(uint32_t edge) {
+
+  ijon_set(edge);
 
 }
 

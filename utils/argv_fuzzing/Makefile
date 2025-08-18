@@ -2,7 +2,7 @@
 # american fuzzy lop++ - argvfuzz
 # --------------------------------
 #
-# Copyright 2019-2023 Kjell Braden <afflux@pentabarf.de>
+# Copyright 2019-2024 Kjell Braden <afflux@pentabarf.de>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -55,10 +55,10 @@ install: argvfuzz32.so argvfuzz64.so
 	if [ -f argvfuzz64.so ]; then set -e; install -m 755 argvfuzz64.so $(DESTDIR)$(HELPER_PATH)/; fi
 
 argv_fuzz_persistent_demo: argv_fuzz_persistent_demo.c
-	../../afl-cc -fsanitize=address -g -o $@ $^
+	../../afl-cc -g -o $@ $^
 
 argv_fuzz_demo: argv_fuzz_demo.c
-	../../afl-cc -fsanitize=address -g -o $@ $^
+	../../afl-cc -g -o $@ $^
 
 demo: argv_fuzz_persistent_demo argv_fuzz_demo
 

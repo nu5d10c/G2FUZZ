@@ -5,11 +5,11 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -25,6 +25,48 @@
 
 #include "afl-fuzz.h"
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "asanfuzz.h"
+
+u16 count_class_lookup16[65536];
+
+/* Destructively simplify trace by eliminating hit count information
+   and replacing it with 0x80 or 0x01 depending on whether the tuple
+   is hit or not. Called on every new crash or timeout, should be
+   reasonably fast. */
+static const u8 simplify_lookup[256] = {
+
+    [0] = 1, [1 ... 255] = 128
+
+};
+
+/* Destructively classify execution counts in a trace. This is used as a
+   preprocessing step for any newly acquired traces. Called on every exec,
+   must be fast. */
+
+static const u8 count_class_lookup8[256] = {
+
+    [0] = 0,
+    [1] = 1,
+    [2] = 2,
+    [3] = 4,
+    [4 ... 7] = 8,
+    [8 ... 15] = 16,
+    [16 ... 31] = 32,
+    [32 ... 127] = 64,
+    [128 ... 255] = 128
+
+};
+
+/* Import coverage processing routines. */
+
+#ifdef WORD_SIZE_64
+  #include "coverage-64.h"
+#else
+  #include "coverage-32.h"
+#endif
+
 #if !defined NAME_MAX
   #define NAME_MAX _XOPEN_NAME_MAX
 #endif
@@ -75,9 +117,13 @@ u32 count_bits(afl_state_t *afl, u8 *mem) {
 
     }
 
+#if __has_builtin(__builtin_popcount)
+    ret += __builtin_popcount(v);
+#else
     v -= ((v >> 1) & 0x55555555);
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
     ret += (((v + (v >> 4)) & 0xF0F0F0F) * 0x01010101) >> 24;
+#endif
 
   }
 
@@ -139,36 +185,6 @@ u32 count_non_255_bytes(afl_state_t *afl, u8 *mem) {
 
 }
 
-/* Destructively simplify trace by eliminating hit count information
-   and replacing it with 0x80 or 0x01 depending on whether the tuple
-   is hit or not. Called on every new crash or timeout, should be
-   reasonably fast. */
-const u8 simplify_lookup[256] = {
-
-    [0] = 1, [1 ... 255] = 128
-
-};
-
-/* Destructively classify execution counts in a trace. This is used as a
-   preprocessing step for any newly acquired traces. Called on every exec,
-   must be fast. */
-
-const u8 count_class_lookup8[256] = {
-
-    [0] = 0,
-    [1] = 1,
-    [2] = 2,
-    [3] = 4,
-    [4 ... 7] = 8,
-    [8 ... 15] = 16,
-    [16 ... 31] = 32,
-    [32 ... 127] = 64,
-    [128 ... 255] = 128
-
-};
-
-u16 count_class_lookup16[65536];
-
 void init_count_class16(void) {
 
   u32 b1, b2;
@@ -185,14 +201,6 @@ void init_count_class16(void) {
   }
 
 }
-
-/* Import coverage processing routines. */
-
-#ifdef WORD_SIZE_64
-  #include "coverage-64.h"
-#else
-  #include "coverage-32.h"
-#endif
 
 /* Check if the current execution path brings anything new to the table.
    Update virgin bits to reflect the finds. Returns 1 if the only change is
@@ -293,6 +301,8 @@ void minimize_bits(afl_state_t *afl, u8 *dst, u8 *src) {
 u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
 
   u8 is_timeout = 0;
+  u8 san_crash_only = (afl->san_case_status & SAN_CRASH_ONLY);
+  u8 non_cov_incr = (afl->san_case_status & NON_COV_INCREASE_BUG);
 
   if (new_bits & 0xf0) {
 
@@ -384,6 +394,10 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
 
   if (new_bits == 2) { strcat(ret, ",+cov"); }
 
+  if (san_crash_only) { strcat(ret, ",+san"); }
+
+  if (non_cov_incr) { strcat(ret, ",+noncov"); }
+
   if (unlikely(strlen(ret) >= max_description_len))
     FATAL("describe string is too long");
 
@@ -452,16 +466,42 @@ void write_crash_readme(afl_state_t *afl) {
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
 
-u8 __attribute__((hot))
-save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
+u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
+                                            u32 len, u8 fault) {
+
+  u8 classified = 0;
 
   if (unlikely(len == 0)) { return 0; }
 
+  if (unlikely(fault == FSRV_RUN_TMOUT && afl->afl_env.afl_ignore_timeouts)) {
+
+    if (unlikely(afl->schedule >= FAST && afl->schedule <= RARE)) {
+
+      classify_counts(&afl->fsrv);
+      u64 cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+      classified = 1;
+
+      // Saturated increment
+      if (likely(afl->n_fuzz[cksum % N_FUZZ_SIZE] < 0xFFFFFFFF))
+        afl->n_fuzz[cksum % N_FUZZ_SIZE]++;
+
+    }
+
+    return 0;
+
+  }
+
   u8  fn[PATH_MAX];
   u8 *queue_fn = "";
-  u8  new_bits = 0, keeping = 0, res, classified = 0, is_timeout = 0;
+  u8  new_bits = 0, keeping = 0, res, is_timeout = 0, need_hash = 1;
   s32 fd;
   u64 cksum = 0;
+  u32 cksum_simplified = 0, cksum_unique = 0;
+  u8  san_fault = 0;
+  u8  san_idx = 0;
+  u8  feed_san = 0;
+
+  afl->san_case_status = 0;
 
   /* Update path frequency. */
 
@@ -469,50 +509,210 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
      only be used for special schedules */
   if (unlikely(afl->schedule >= FAST && afl->schedule <= RARE)) {
 
+    classify_counts(&afl->fsrv);
+    need_hash = 0;
+
     cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
 
     /* Saturated increment */
-    if (afl->n_fuzz[cksum % N_FUZZ_SIZE] < 0xFFFFFFFF)
+    if (likely(afl->n_fuzz[cksum % N_FUZZ_SIZE] < 0xFFFFFFFF))
       afl->n_fuzz[cksum % N_FUZZ_SIZE]++;
 
   }
 
+  /* Only "normal" inputs seem interested to us */
+  if (likely(fault == afl->crash_mode)) {
+
+    if (unlikely(afl->san_binary_length) &&
+        likely(afl->san_abstraction == SIMPLIFY_TRACE)) {
+
+      memcpy(afl->san_fsrvs[0].trace_bits, afl->fsrv.trace_bits,
+             afl->fsrv.map_size);
+      simplify_trace(afl, afl->san_fsrvs[0].trace_bits);
+
+      // Note: Original SAND implementation used XXHASH32
+      cksum_simplified =
+          hash32(afl->san_fsrvs[0].trace_bits, afl->fsrv.map_size, HASH_CONST);
+
+      if (unlikely(!bitmap_read(afl->simplified_n_fuzz, cksum_simplified))) {
+
+        feed_san = 1;
+        bitmap_set(afl->simplified_n_fuzz, cksum_simplified);
+
+      }
+
+    }
+
+    if (unlikely(afl->san_binary_length) &&
+        unlikely(afl->san_abstraction == COVERAGE_INCREASE)) {
+
+      /* Check if the input increase the coverage */
+      new_bits = has_new_bits_unclassified(afl, afl->virgin_bits);
+
+      if (unlikely(new_bits)) { feed_san = 1; }
+
+    }
+
+    if (unlikely(afl->san_binary_length) &&
+        likely(afl->san_abstraction == UNIQUE_TRACE)) {
+
+      // If schedule is not FAST..RARE, we need to classify counts here
+      // Note: SAND was evaluated under FAST schedule but should also work
+      //       with other scedules.
+      if (!classified) {
+
+        classify_counts(&afl->fsrv);
+        classified = 1;
+
+      }
+
+      cksum_unique =
+          hash32(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+      if (unlikely(!bitmap_read(afl->n_fuzz_dup, cksum) &&
+                   fault == afl->crash_mode)) {
+
+        feed_san = 1;
+        bitmap_set(afl->n_fuzz_dup, cksum_unique);
+
+      }
+
+    }
+
+    if (feed_san) {
+
+      /* The input seems interested to other sanitizers, feed it into extra
+       * binaries. */
+
+      for (san_idx = 0; san_idx < afl->san_binary_length; san_idx++) {
+
+        len = write_to_testcase(afl, &mem, len, 0);
+        san_fault = fuzz_run_target(afl, &afl->san_fsrvs[san_idx],
+                                    afl->san_fsrvs[san_idx].exec_tmout);
+
+        // DEBUGF("ASAN Result: %hhd\n", asan_fault);
+
+        if (unlikely(san_fault && fault == afl->crash_mode)) {
+
+          /* sanitizers discovers distinct bugs! */
+          afl->san_case_status |= SAN_CRASH_ONLY;
+
+        }
+
+        if (san_fault == FSRV_RUN_CRASH) {
+
+          /* Treat this execution as fault detected by ASAN */
+          // fault = san_fault;
+
+          /* That's pretty enough, break to avoid more overhead. */
+          break;
+
+        } else {
+
+          // or keep san_fault as ok
+          san_fault = FSRV_RUN_OK;
+
+        }
+
+      }
+
+    }
+
+  }
+
+  /* If there is no crash, everything is fine. */
   if (likely(fault == afl->crash_mode)) {
 
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
+    if (!unlikely(afl->san_abstraction == COVERAGE_INCREASE && feed_san)) {
 
-    new_bits = has_new_bits_unclassified(afl, afl->virgin_bits);
+      /* If we are in coverage increasing abstraction and have fed input to
+         sanitizers, we are sure it has new bits.*/
+      if (classified) {
 
-    if (likely(!new_bits)) {
+        /* We could have classified the bits in SAND with UNIQUE_TRACE */
+        new_bits = has_new_bits(afl, afl->virgin_bits);
 
-      if (unlikely(afl->crash_mode)) { ++afl->total_crashes; }
-      return 0;
+      } else {
+
+        new_bits = has_new_bits_unclassified(afl, afl->virgin_bits);
+
+      }
 
     }
 
-    classified = new_bits;
+    if (likely(!new_bits)) {
+
+      if (san_fault == FSRV_RUN_OK) {
+
+        if (unlikely(afl->crash_mode)) { ++afl->total_crashes; }
+        return 0;
+
+      } else {
+
+        afl->san_case_status |= NON_COV_INCREASE_BUG;
+        fault = san_fault;
+        goto may_save_fault;
+
+      }
+
+    }
+
+    fault = san_fault;
 
   save_to_queue:
 
 #ifndef SIMPLE_FILES
 
-    queue_fn =
-        alloc_printf("%s/queue/id:%06u,%s", afl->out_dir, afl->queued_items,
-                     describe_op(afl, new_bits + is_timeout,
-                                 NAME_MAX - strlen("id:000000,")));
+    if (!afl->afl_env.afl_sha1_filenames) {
+
+      queue_fn = alloc_printf(
+          "%s/queue/id:%06u,%s%s%s", afl->out_dir, afl->queued_items,
+          describe_op(afl, new_bits + is_timeout,
+                      NAME_MAX - strlen("id:000000,")),
+          afl->file_extension ? "." : "",
+          afl->file_extension ? (const char *)afl->file_extension : "");
+
+    } else {
+
+      const char *hex = sha1_hex(mem, len);
+      queue_fn = alloc_printf(
+          "%s/queue/%s%s%s", afl->out_dir, hex, afl->file_extension ? "." : "",
+          afl->file_extension ? (const char *)afl->file_extension : "");
+      ck_free((char *)hex);
+
+    }
 
 #else
 
-    queue_fn =
-        alloc_printf("%s/queue/id_%06u", afl->out_dir, afl->queued_items);
+    queue_fn = alloc_printf(
+        "%s/queue/id_%06u%s%s", afl->out_dir, afl->queued_items,
+        afl->file_extension ? "." : "",
+        afl->file_extension ? (const char *)afl->file_extension : "");
 
 #endif                                                    /* ^!SIMPLE_FILES */
-    fd = open(queue_fn, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
-    if (unlikely(fd < 0)) { PFATAL("Unable to create '%s'", queue_fn); }
-    ck_write(fd, mem, len, queue_fn);
-    close(fd);
+    fd = permissive_create(afl, queue_fn);
+    if (likely(fd >= 0)) {
+
+      ck_write(fd, mem, len, queue_fn);
+      close(fd);
+
+    }
+
     add_to_queue(afl, queue_fn, len, 0);
+
+    if (unlikely(afl->fuzz_mode) &&
+        likely(afl->switch_fuzz_mode && !afl->non_instrumented_mode)) {
+
+      if (afl->afl_env.afl_no_ui) {
+
+        ACTF("New coverage found, switching back to exploration mode.");
+
+      }
+
+      afl->fuzz_mode = 0;
+
+    }
 
 #ifdef INTROSPECTION
     if (afl->custom_mutators_count && afl->current_custom_fuzz) {
@@ -550,21 +750,25 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
     }
 
-    /* AFLFast schedule? update the new queue entry */
-    if (cksum) {
+    if (unlikely(need_hash && new_bits)) {
+
+      /* due to classify counts we have to recalculate the checksum */
+      afl->queue_top->exec_cksum =
+          hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+      need_hash = 0;
+
+    }
+
+    /* For AFLFast schedules we update the new queue entry */
+    if (likely(cksum)) {
 
       afl->queue_top->n_fuzz_entry = cksum % N_FUZZ_SIZE;
       afl->n_fuzz[afl->queue_top->n_fuzz_entry] = 1;
 
     }
 
-    /* due to classify counts we have to recalculate the checksum */
-    afl->queue_top->exec_cksum =
-        hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
-
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
-
     res = calibrate_case(afl, afl->queue_top, mem, afl->queue_cycle - 1, 0);
 
     if (unlikely(res == FSRV_RUN_ERROR)) {
@@ -583,6 +787,7 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
   }
 
+may_save_fault:
   switch (fault) {
 
     case FSRV_RUN_TMOUT:
@@ -597,13 +802,6 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
       if (afl->saved_hangs >= KEEP_UNIQUE_HANG) { return keeping; }
 
       if (likely(!afl->non_instrumented_mode)) {
-
-        if (!classified) {
-
-          classify_counts(&afl->fsrv);
-          classified = 1;
-
-        }
 
         simplify_trace(afl, afl->fsrv.trace_bits);
 
@@ -692,14 +890,29 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
 #ifndef SIMPLE_FILES
 
-      snprintf(fn, PATH_MAX, "%s/hangs/id:%06llu,%s", afl->out_dir,
-               afl->saved_hangs,
-               describe_op(afl, 0, NAME_MAX - strlen("id:000000,")));
+      if (!afl->afl_env.afl_sha1_filenames) {
+
+        snprintf(fn, PATH_MAX, "%s/hangs/id:%06llu,%s%s%s", afl->out_dir,
+                 afl->saved_hangs,
+                 describe_op(afl, 0, NAME_MAX - strlen("id:000000,")),
+                 afl->file_extension ? "." : "",
+                 afl->file_extension ? (const char *)afl->file_extension : "");
+
+      } else {
+
+        const char *hex = sha1_hex(mem, len);
+        snprintf(fn, PATH_MAX, "%s/hangs/%s%s%s", afl->out_dir, hex,
+                 afl->file_extension ? "." : "",
+                 afl->file_extension ? (const char *)afl->file_extension : "");
+        ck_free((char *)hex);
+
+      }
 
 #else
 
-      snprintf(fn, PATH_MAX, "%s/hangs/id_%06llu", afl->out_dir,
-               afl->saved_hangs);
+      snprintf(fn, PATH_MAX, "%s/hangs/id_%06llu%s%s", afl->out_dir,
+               afl->saved_hangs, afl->file_extension ? "." : "",
+               afl->file_extension ? (const char *)afl->file_extension : "");
 
 #endif                                                    /* ^!SIMPLE_FILES */
 
@@ -723,8 +936,6 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
       if (likely(!afl->non_instrumented_mode)) {
 
-        if (!classified) { classify_counts(&afl->fsrv); }
-
         simplify_trace(afl, afl->fsrv.trace_bits);
 
         if (!has_new_bits(afl, afl->virgin_crash)) { return keeping; }
@@ -740,14 +951,30 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
 #ifndef SIMPLE_FILES
 
-      snprintf(fn, PATH_MAX, "%s/crashes/id:%06llu,sig:%02u,%s", afl->out_dir,
-               afl->saved_crashes, afl->fsrv.last_kill_signal,
-               describe_op(afl, 0, NAME_MAX - strlen("id:000000,sig:00,")));
+      if (!afl->afl_env.afl_sha1_filenames) {
+
+        snprintf(fn, PATH_MAX, "%s/crashes/id:%06llu,sig:%02u,%s%s%s",
+                 afl->out_dir, afl->saved_crashes, afl->fsrv.last_kill_signal,
+                 describe_op(afl, 0, NAME_MAX - strlen("id:000000,sig:00,")),
+                 afl->file_extension ? "." : "",
+                 afl->file_extension ? (const char *)afl->file_extension : "");
+
+      } else {
+
+        const char *hex = sha1_hex(mem, len);
+        snprintf(fn, PATH_MAX, "%s/crashes/%s%s%s", afl->out_dir, hex,
+                 afl->file_extension ? "." : "",
+                 afl->file_extension ? (const char *)afl->file_extension : "");
+        ck_free((char *)hex);
+
+      }
 
 #else
 
-      snprintf(fn, PATH_MAX, "%s/crashes/id_%06llu_%02u", afl->out_dir,
-               afl->saved_crashes, afl->fsrv.last_kill_signal);
+      snprintf(fn, PATH_MAX, "%s/crashes/id_%06llu_%02u%s%s", afl->out_dir,
+               afl->saved_crashes, afl->fsrv.last_kill_signal,
+               afl->file_extension ? "." : "",
+               afl->file_extension ? (const char *)afl->file_extension : "");
 
 #endif                                                    /* ^!SIMPLE_FILES */
 
@@ -810,10 +1037,13 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
   /* If we're here, we apparently want to save the crash or hang
      test case, too. */
 
-  fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
-  if (unlikely(fd < 0)) { PFATAL("Unable to create '%s'", fn); }
-  ck_write(fd, mem, len, fn);
-  close(fd);
+  fd = permissive_create(afl, fn);
+  if (fd >= 0) {
+
+    ck_write(fd, mem, len, fn);
+    close(fd);
+
+  }
 
 #ifdef __linux__
   if (afl->fsrv.nyx_mode && fault == FSRV_RUN_CRASH) {
@@ -825,7 +1055,8 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
     if (unlikely(fd < 0)) { PFATAL("Unable to create '%s'", fn_log); }
 
     u32 nyx_aux_string_len = afl->fsrv.nyx_handlers->nyx_get_aux_string(
-        afl->fsrv.nyx_runner, afl->fsrv.nyx_aux_string, 0x1000);
+        afl->fsrv.nyx_runner, afl->fsrv.nyx_aux_string,
+        afl->fsrv.nyx_aux_string_len);
 
     ck_write(fd, afl->fsrv.nyx_aux_string, nyx_aux_string_len, fn_log);
     close(fd);

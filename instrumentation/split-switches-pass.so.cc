@@ -84,7 +84,7 @@ class SplitSwitchesTransform : public ModulePass {
 #if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
 #else
-  bool      runOnModule(Module &M) override;
+  bool runOnModule(Module &M) override;
 
   #if LLVM_VERSION_MAJOR >= 4
   StringRef getPassName() const override {
@@ -137,8 +137,18 @@ llvmGetPassPluginInfo() {
     #if LLVM_VERSION_MAJOR <= 13
             using OptimizationLevel = typename PassBuilder::OptimizationLevel;
     #endif
+    #if LLVM_VERSION_MAJOR >= 16
+            PB.registerOptimizerEarlyEPCallback(
+    #else
             PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel OL) {
+    #endif
+                [](ModulePassManager &MPM, OptimizationLevel OL
+    #if LLVM_VERSION_MAJOR >= 20
+                   ,
+                   ThinOrFullLTOPhase Phase
+    #endif
+
+                ) {
 
                   MPM.addPass(SplitSwitchesTransform());
 
@@ -225,12 +235,20 @@ BasicBlock *SplitSwitchesTransform::switchConvert(
   BasicBlock  *NewNode = BasicBlock::Create(Val->getContext(), "NodeBlock", F);
   Shift = BinaryOperator::Create(Instruction::LShr, Val,
                                  ConstantInt::get(ValType, smallestIndex * 8));
+#if LLVM_VERSION_MAJOR >= 16
+  Shift->insertInto(NewNode, NewNode->end());
+#else
   NewNode->getInstList().push_back(Shift);
+#endif
 
   if (ValTypeBitWidth > 8) {
 
     Trunc = new TruncInst(Shift, ByteType);
+#if LLVM_VERSION_MAJOR >= 16
+    Trunc->insertInto(NewNode, NewNode->end());
+#else
     NewNode->getInstList().push_back(Trunc);
+#endif
 
   } else {
 
@@ -253,7 +271,11 @@ BasicBlock *SplitSwitchesTransform::switchConvert(
     ICmpInst *Comp =
         new ICmpInst(ICmpInst::ICMP_EQ, Trunc, ConstantInt::get(ByteType, byte),
                      "byteMatch");
+#if LLVM_VERSION_MAJOR >= 16
+    Comp->insertInto(NewNode, NewNode->end());
+#else
     NewNode->getInstList().push_back(Comp);
+#endif
 
     bytesChecked[smallestIndex] = true;
     bool allBytesAreChecked = true;
@@ -355,7 +377,11 @@ BasicBlock *SplitSwitchesTransform::switchConvert(
     ICmpInst *Comp =
         new ICmpInst(ICmpInst::ICMP_ULT, Trunc,
                      ConstantInt::get(ByteType, pivot), "byteMatch");
+#if LLVM_VERSION_MAJOR >= 16
+    Comp->insertInto(NewNode, NewNode->end());
+#else
     NewNode->getInstList().push_back(Comp);
+#endif
     BranchInst::Create(LBB, RBB, Comp, NewNode);
 
   }
@@ -452,7 +478,11 @@ bool SplitSwitchesTransform::splitSwitches(Module &M) {
     BranchInst::Create(SwitchBlock, OrigBlock);
 
     /* We are now done with the switch instruction, delete it. */
+#if LLVM_VERSION_MAJOR >= 16
+    SI->eraseFromParent();
+#else
     CurBlock->getInstList().erase(SI);
+#endif
 
     /* we have to update the phi nodes! */
     for (BasicBlock::iterator I = Default->begin(); I != Default->end(); ++I) {
@@ -496,11 +526,7 @@ bool SplitSwitchesTransform::runOnModule(Module &M) {
   else
     be_quiet = 1;
 
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
-  auto PA = PreservedAnalyses::all();
-#endif
-
-  splitSwitches(M);
+  bool ret = splitSwitches(M);
   verifyModule(M);
 
 #if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
@@ -510,9 +536,12 @@ bool SplitSwitchesTransform::runOnModule(Module &M) {
                            
                                }*/
 
-  return PA;
+  if (ret == false)
+    return PreservedAnalyses::all();
+  else
+    return PreservedAnalyses();
 #else
-  return true;
+  return ret;
 #endif
 
 }

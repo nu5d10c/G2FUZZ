@@ -5,11 +5,12 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
-                        Andrea Fioraldi <andreafioraldi@gmail.com>
+                     Dominik Meier <mail@dmnk.co>,
+                     Andrea Fioraldi <andreafioraldi@gmail.com>, and
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -24,7 +25,9 @@
  */
 
 #include "afl-fuzz.h"
+#include "alloc-inl.h"
 #include "cmplog.h"
+#include "asanfuzz.h"
 #include "common.h"
 #include <limits.h>
 #include <stdlib.h>
@@ -34,6 +37,67 @@
   #include <fcntl.h>
   #include <sys/ipc.h>
   #include <sys/shm.h>
+#endif
+#ifdef HAVE_ZLIB
+
+  #define ck_gzread(fd, buf, len, fn)                            \
+    do {                                                         \
+                                                                 \
+      s32 _len = (s32)(len);                                     \
+      s32 _res = gzread(fd, buf, _len);                          \
+      if (_res != _len) RPFATAL(_res, "Short read from %s", fn); \
+                                                                 \
+    } while (0)
+
+  #define ck_gzwrite(fd, buf, len, fn)                                    \
+    do {                                                                  \
+                                                                          \
+      if (len <= 0) break;                                                \
+      s32 _written = 0, _off = 0, _len = (s32)(len);                      \
+                                                                          \
+      do {                                                                \
+                                                                          \
+        s32 _res = gzwrite(fd, (buf) + _off, _len);                       \
+        if (_res != _len && (_res > 0 && _written + _res != _len)) {      \
+                                                                          \
+          if (_res > 0) {                                                 \
+                                                                          \
+            _written += _res;                                             \
+            _len -= _res;                                                 \
+            _off += _res;                                                 \
+                                                                          \
+          } else {                                                        \
+                                                                          \
+            RPFATAL(_res, "Short write to %s (%d of %d bytes)", fn, _res, \
+                    _len);                                                \
+                                                                          \
+          }                                                               \
+                                                                          \
+        } else {                                                          \
+                                                                          \
+          break;                                                          \
+                                                                          \
+        }                                                                 \
+                                                                          \
+      } while (1);                                                        \
+                                                                          \
+                                                                          \
+                                                                          \
+    } while (0)
+
+  #include <zlib.h>
+  #define ZLIBOPEN gzopen
+  #define ZLIBREAD ck_gzread
+  #define NZLIBREAD gzread
+  #define ZLIBWRITE ck_gzwrite
+  #define ZLIBCLOSE gzclose
+  #define ZLIB_EXTRA "9"
+#else
+  #define ZLIBOPEN open
+  #define NZLIBREAD read
+  #define ZLIBREAD ck_read
+  #define ZLIBWRITE ck_write
+  #define ZLIBCLOSE close
 #endif
 
 #ifdef __APPLE__
@@ -108,7 +172,7 @@ static void at_exit() {
 
   if (pid2 > 0) {
 
-    pgrp = getpgid(pid1);
+    pgrp = getpgid(pid2);
     if (pgrp > 0) { killpg(pgrp, kill_signal); }
     kill(pid2, kill_signal);
 
@@ -124,12 +188,21 @@ static void usage(u8 *argv0, int more_help) {
       "\n%s [ options ] -- /path/to/fuzzed_app [ ... ]\n\n"
 
       "Required parameters:\n"
-      "  -i dir        - input directory with test cases\n"
+      "  -i dir        - input directory with test cases (or '-' to resume, "
+      "also see \n"
+      "                  AFL_AUTORESUME)\n"
       "  -o dir        - output directory for fuzzer findings\n\n"
 
       "Execution control settings:\n"
+      "  -P strategy   - set fix mutation strategy: explore (focus on new "
+      "coverage),\n"
+      "                  exploit (focus on triggering crashes). You can also "
+      "set a\n"
+      "                  number of seconds after without any finds it switches "
+      "to\n"
+      "                  exploit mode, and back on new coverage (default: %u)\n"
       "  -p schedule   - power schedules compute a seed's performance score:\n"
-      "                  fast(default), explore, exploit, seek, rare, mmopt, "
+      "                  explore(default), fast, exploit, seek, rare, mmopt, "
       "coe, lin\n"
       "                  quad -- see docs/FAQ.md for more information\n"
       "  -f file       - location read by the fuzzed program (default: stdin "
@@ -156,38 +229,47 @@ static void usage(u8 *argv0, int more_help) {
       "\n"
 
       "Mutator settings:\n"
+      "  -a type       - target input format, \"text\" or \"binary\" (default: "
+      "generic)\n"
       "  -g minlength  - set min length of generated fuzz input (default: 1)\n"
       "  -G maxlength  - set max length of generated fuzz input (default: "
       "%lu)\n"
-      "  -D            - enable deterministic fuzzing (once per queue entry)\n"
       "  -L minutes    - use MOpt(imize) mode and set the time limit for "
       "entering the\n"
       "                  pacemaker mode (minutes of no new finds). 0 = "
       "immediately,\n"
       "                  -1 = immediately and together with normal mutation.\n"
-      "                  See docs/README.MOpt.md\n"
+      "                  Note: this option is usually not very effective\n"
+      "  -u            - enable testcase splicing\n"
       "  -c program    - enable CmpLog by specifying a binary compiled for "
       "it.\n"
       "                  if using QEMU/FRIDA or the fuzzing target is "
       "compiled\n"
-      "                  for CmpLog then just use -c 0.\n"
+      "                  for CmpLog then use '-c 0'. To disable CMPLOG use '-c "
+      "-'.\n"
       "  -l cmplog_opts - CmpLog configuration values (e.g. \"2ATR\"):\n"
       "                  1=small files, 2=larger files (default), 3=all "
       "files,\n"
       "                  A=arithmetic solving, T=transformational solving,\n"
-      "                  R=random colorization bytes.\n\n"
+      "                  X=extreme transform solving, R=random colorization "
+      "bytes.\n\n"
       "Fuzzing behavior settings:\n"
-      "  -Z            - sequential queue selection instead of weighted "
+      "  -Z             - sequential queue selection instead of weighted "
       "random\n"
-      "  -N            - do not unlink the fuzzing input file (for devices "
+      "  -N             - do not unlink the fuzzing input file (for devices "
       "etc.)\n"
-      "  -n            - fuzz without instrumentation (non-instrumented mode)\n"
-      "  -x dict_file  - fuzzer dictionary (see README.md, specify up to 4 "
-      "times)\n\n"
+      "  -n             - fuzz without instrumentation (non-instrumented "
+      "mode)\n"
+      "  -x dict_file   - fuzzer dictionary (see README.md, specify up to 4 "
+      "times)\n"
+      "  -w san_binary  - Specify the extra sanitizer instrumented binaries,\n"
+      "                   can be specified multiple times.\n"
+      "                   Read docs/SAND.md for details.\n\n"
 
       "Test settings:\n"
       "  -s seed       - use a fixed seed for the RNG\n"
-      "  -V seconds    - fuzz for a specified time then terminate\n"
+      "  -V seconds    - fuzz for a specified time then terminate (fuzz time "
+      "only!)\n"
       "  -E execs      - fuzz for an approx. no. of total executions then "
       "terminate\n"
       "                  Note: not precise and can have several more "
@@ -200,7 +282,8 @@ static void usage(u8 *argv0, int more_help) {
       "  -F path       - sync to a foreign fuzzer queue directory (requires "
       "-M, can\n"
       "                  be specified up to %u times)\n"
-      // "  -d            - skip deterministic fuzzing in -M mode\n"
+      "  -z            - skip the enhanced deterministic fuzzing\n"
+      "                  (note that the old -d and -D flags are ignored.)\n"
       "  -T text       - text banner to show on the screen\n"
       "  -I command    - execute this command/script when a new crash is "
       "found\n"
@@ -210,8 +293,10 @@ static void usage(u8 *argv0, int more_help) {
       "  -b cpu_id     - bind the fuzzing process to the specified CPU core "
       "(0-...)\n"
       "  -e ext        - file extension for the fuzz test input file (if "
-      "needed)\n\n",
-      argv0, EXEC_TIMEOUT, MEM_LIMIT, MAX_FILE, FOREIGN_SYNCS_MAX);
+      "needed)\n"
+      "\n",
+      argv0, STRATEGY_SWITCH_TIME, EXEC_TIMEOUT, MEM_LIMIT, MAX_FILE,
+      FOREIGN_SYNCS_MAX);
 
   if (more_help > 1) {
 
@@ -247,10 +332,12 @@ static void usage(u8 *argv0, int more_help) {
       "AFL_CYCLE_SCHEDULES: after completing a cycle, switch to a different -p schedule\n"
       "AFL_DEBUG: extra debugging output for Python mode trimming\n"
       "AFL_DEBUG_CHILD: do not suppress stdout/stderr from target\n"
+      "AFL_DISABLE_REDUNDANT: disable any queue item that is redundant\n"
       "AFL_DISABLE_TRIM: disable the trimming of test cases\n"
       "AFL_DUMB_FORKSRV: use fork server without feedback from target\n"
       "AFL_EXIT_WHEN_DONE: exit when all inputs are run and no new finds are found\n"
       "AFL_EXIT_ON_TIME: exit when no new coverage is found within the specified time\n"
+      "AFL_EXIT_ON_SEED_ISSUES: exit on any kind of seed issues\n"
       "AFL_EXPAND_HAVOC_NOW: immediately enable expand havoc mode (default: after 60\n"
       "                      minutes and a cycle without finds)\n"
       "AFL_FAST_CAL: limit the calibration stage to three cycles for speedup\n"
@@ -258,11 +345,17 @@ static void usage(u8 *argv0, int more_help) {
       "AFL_FORKSRV_INIT_TMOUT: time spent waiting for forkserver during startup (in ms)\n"
       "AFL_HANG_TMOUT: override timeout value (in milliseconds)\n"
       "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: don't warn about core dump handlers\n"
-      "AFL_IGNORE_UNKNOWN_ENVS: don't warn on unknown env vars\n"
       "AFL_IGNORE_PROBLEMS: do not abort fuzzing if an incorrect setup is detected\n"
+      "AFL_IGNORE_PROBLEMS_COVERAGE: if set in addition to AFL_IGNORE_PROBLEMS - also\n"
+      "                              ignore those libs for coverage\n"
+      "AFL_IGNORE_SEED_PROBLEMS: skip over crashes and timeouts in the seeds instead of\n"
+      "                          exiting\n"
+      "AFL_IGNORE_TIMEOUTS: do not process or save any timeouts\n"
+      "AFL_IGNORE_UNKNOWN_ENVS: don't warn on unknown env vars\n"
       "AFL_IMPORT_FIRST: sync and import test cases from other fuzzer instances first\n"
       "AFL_INPUT_LEN_MIN/AFL_INPUT_LEN_MAX: like -g/-G set min/max fuzz length produced\n"
-      "AFL_PIZZA_MODE: 1 - enforce pizza mode, 0 - disable for April 1st\n"
+      "AFL_PIZZA_MODE: 1 - enforce pizza mode, -1 - disable for April 1st,\n"
+      "                0 (default) - activate on April 1st\n"
       "AFL_KILL_SIGNAL: Signal ID delivered to child processes on timeout, etc.\n"
       "                 (default: SIGKILL)\n"
       "AFL_FORK_SERVER_KILL_SIGNAL: Kill signal for the fork server on termination\n"
@@ -281,8 +374,14 @@ static void usage(u8 *argv0, int more_help) {
       "AFL_NO_FORKSRV: run target via execve instead of using the forkserver\n"
       "AFL_NO_SNAPSHOT: do not use the snapshot feature (if the snapshot lkm is loaded)\n"
       "AFL_NO_STARTUP_CALIBRATION: no initial seed calibration, start fuzzing at once\n"
+      "AFL_NO_WARN_INSTABILITY: no warn about instability issues on startup calibration\n"
       "AFL_NO_UI: switch status screen off\n"
-
+      "AFL_NYX_AUX_SIZE: size of the Nyx auxiliary buffer. Must be a multiple of 4096.\n"
+      "                  Increase this value in case the crash reports are truncated.\n"
+      "                  Default value is 4096.\n"
+      "AFL_NYX_DISABLE_SNAPSHOT_MODE: disable snapshot mode (must be supported by the agent)\n"
+      "AFL_NYX_LOG: output NYX hprintf messages to another file\n"
+      "AFL_NYX_REUSE_SNAPSHOT: reuse an existing Nyx root snapshot\n"
       DYN_COLOR
 
       "AFL_PATH: path to AFL support binaries\n"
@@ -291,6 +390,8 @@ static void usage(u8 *argv0, int more_help) {
 
       PERSISTENT_MSG
 
+      "AFL_POST_PROCESS_KEEP_ORIGINAL: save the file as it was prior post-processing to\n"
+      "                                the queue, but execute the post-processed one\n"
       "AFL_PRELOAD: LD_PRELOAD / DYLD_INSERT_LIBRARIES settings for target\n"
       "AFL_TARGET_ENV: pass extra environment variables to target\n"
       "AFL_SHUFFLE_QUEUE: reorder the input queue randomly on startup\n"
@@ -301,16 +402,20 @@ static void usage(u8 *argv0, int more_help) {
       "AFL_STATSD_HOST: change default statsd host (default 127.0.0.1)\n"
       "AFL_STATSD_PORT: change default statsd port (default: 8125)\n"
       "AFL_STATSD_TAGS_FLAVOR: set statsd tags format (default: disable tags)\n"
-      "                        Supported formats are: 'dogstatsd', 'librato',\n"
-      "                        'signalfx' and 'influxdb'\n"
+      "                        supported formats: dogstatsd, librato, signalfx, influxdb\n"
+      "AFL_NO_FASTRESUME: do not read or write a fast resume file\n"
+      "AFL_NO_SYNC: disables all syncing\n"
       "AFL_SYNC_TIME: sync time between fuzzing instances (in minutes)\n"
+      "AFL_FINAL_SYNC: sync a final time when exiting (will delay the exit!)\n"
       "AFL_NO_CRASH_README: do not create a README in the crashes directory\n"
       "AFL_TESTCACHE_SIZE: use a cache for testcases, improves performance (in MB)\n"
       "AFL_TMPDIR: directory to use for input file generation (ramdisk recommended)\n"
       "AFL_EARLY_FORKSERVER: force an early forkserver in an afl-clang-fast/\n"
       "                      afl-clang-lto/afl-gcc-fast target\n"
-      "AFL_PERSISTENT: enforce persistent mode (if __AFL_LOOP is in a shared lib\n"
-      "AFL_DEFER_FORKSRV: enforced deferred forkserver (__AFL_INIT is in a .so\n"
+      "AFL_PERSISTENT: enforce persistent mode (if __AFL_LOOP is in a shared lib)\n"
+      "AFL_DEFER_FORKSRV: enforced deferred forkserver (__AFL_INIT is in a shared lib)\n"
+      "AFL_FUZZER_STATS_UPDATE_INTERVAL: interval to update fuzzer_stats file in\n"
+      "                                  seconds (default: 60, minimum: 1)\n"
       "\n"
     );
 
@@ -323,7 +428,7 @@ static void usage(u8 *argv0, int more_help) {
   }
 
 #ifdef USE_PYTHON
-  SAYF("Compiled with %s module support, see docs/custom_mutator.md\n",
+  SAYF("Compiled with %s module support, see docs/custom_mutators.md\n",
        (char *)PYTHON_VERSION);
 #else
   SAYF("Compiled without Python module support.\n");
@@ -345,8 +450,8 @@ static void usage(u8 *argv0, int more_help) {
   SAYF("Compiled with ASAN_BUILD.\n");
 #endif
 
-#ifdef NO_SPLICING
-  SAYF("Compiled with NO_SPLICING.\n");
+#ifdef FANCY_BOXES_NO_UTF
+  SAYF("Compiled without UTF-8 support for line rendering in status screen.\n");
 #endif
 
 #ifdef PROFILING
@@ -363,6 +468,12 @@ static void usage(u8 *argv0, int more_help) {
 
 #ifdef _AFL_DOCUMENT_MUTATIONS
   SAYF("Compiled with _AFL_DOCUMENT_MUTATIONS.\n");
+#endif
+
+#ifdef _AFL_SPECIAL_PERFORMANCE
+  SAYF(
+      "Compiled with special performance options for this specific system, it "
+      "might not work on other platforms!\n");
 #endif
 
   SAYF("For additional help please consult %s/README.md :)\n\n", doc_path);
@@ -432,203 +543,18 @@ static void fasan_check_afl_preload(char *afl_preload) {
 
 }
 
-  #ifdef __linux__
-    #include <dlfcn.h>
-
-nyx_plugin_handler_t *afl_load_libnyx_plugin(u8 *libnyx_binary) {
-
-  void                 *handle;
-  nyx_plugin_handler_t *plugin = calloc(1, sizeof(nyx_plugin_handler_t));
-
-  ACTF("Trying to load libnyx.so plugin...");
-  handle = dlopen((char *)libnyx_binary, RTLD_NOW);
-  if (!handle) { goto fail; }
-
-  plugin->nyx_new = dlsym(handle, "nyx_new");
-  if (plugin->nyx_new == NULL) { goto fail; }
-
-  plugin->nyx_new_parent = dlsym(handle, "nyx_new_parent");
-  if (plugin->nyx_new_parent == NULL) { goto fail; }
-
-  plugin->nyx_new_child = dlsym(handle, "nyx_new_child");
-  if (plugin->nyx_new_child == NULL) { goto fail; }
-
-  plugin->nyx_shutdown = dlsym(handle, "nyx_shutdown");
-  if (plugin->nyx_shutdown == NULL) { goto fail; }
-
-  plugin->nyx_option_set_reload_mode =
-      dlsym(handle, "nyx_option_set_reload_mode");
-  if (plugin->nyx_option_set_reload_mode == NULL) { goto fail; }
-
-  plugin->nyx_option_set_timeout = dlsym(handle, "nyx_option_set_timeout");
-  if (plugin->nyx_option_set_timeout == NULL) { goto fail; }
-
-  plugin->nyx_option_apply = dlsym(handle, "nyx_option_apply");
-  if (plugin->nyx_option_apply == NULL) { goto fail; }
-
-  plugin->nyx_set_afl_input = dlsym(handle, "nyx_set_afl_input");
-  if (plugin->nyx_set_afl_input == NULL) { goto fail; }
-
-  plugin->nyx_exec = dlsym(handle, "nyx_exec");
-  if (plugin->nyx_exec == NULL) { goto fail; }
-
-  plugin->nyx_get_bitmap_buffer = dlsym(handle, "nyx_get_bitmap_buffer");
-  if (plugin->nyx_get_bitmap_buffer == NULL) { goto fail; }
-
-  plugin->nyx_get_bitmap_buffer_size =
-      dlsym(handle, "nyx_get_bitmap_buffer_size");
-  if (plugin->nyx_get_bitmap_buffer_size == NULL) { goto fail; }
-
-  plugin->nyx_get_aux_string = dlsym(handle, "nyx_get_aux_string");
-  if (plugin->nyx_get_aux_string == NULL) { goto fail; }
-
-  OKF("libnyx plugin is ready!");
-  return plugin;
-
-fail:
-
-  FATAL("failed to load libnyx: %s\n", dlerror());
-  free(plugin);
-  return NULL;
-
-}
-
-  #endif
-
-// u8 run_mutated_seeds(afl_state_t * afl){
-//   afl->stage_name = "llmMutate";
-//   afl->stage_short = "llmMutate";
-
-//   u32 current_entry_bak = afl->current_entry;
-  
-
-//   char command[100];
-//   snprintf(command, sizeof(command), "python program_mutation.py --output ./output >> mutate_log");
-//   int result = system(command);
-//   if (result == 0) {
-//       printf("Command executed successfully.\n");
-//   } else {
-//       printf("Command failed with exit code %d.\n", result);
-//   }
-
-//   DIR *dp;
-//   struct dirent *entry_tmp;
-//   struct stat file_stat;
-//   char *dir = strdup("./output/mutated_seeds");
-//   dp = opendir(dir);
-//   if (!dp) {
-//       perror("opendir");
-//       return 1;
-//   }
-
-//   while ((entry_tmp = readdir(dp)) != NULL) {
-//       char path[1024];
-//       snprintf(path, sizeof(path), "%s/%s", dir, entry_tmp->d_name);
-
-//       if (stat(path, &file_stat) == 0) {
-//           if (S_ISREG(file_stat.st_mode)) {
-//               u32 len = (u32)file_stat.st_size;
-//               char *file_name = basename(path);
-//               // printf("File: %s, Length: %u bytes\n", file_name, len);
-
-//               // char *underscore_pos = strstr(file_name, "_");
-//               // char *dot_pos = strstr(file_name, ".");
-//               // char new_file_name[1024];
-//               // if (underscore_pos != NULL && dot_pos != NULL) {
-//               //     // Calculate the length of the substring to be deleted
-//               //     size_t delete_length = dot_pos - underscore_pos;
-
-//               //     // Copy the part before "_"
-                  
-//               //     strncpy(new_file_name, file_name, underscore_pos - file_name);
-//               //     new_file_name[underscore_pos - file_name] = '\0';
-
-//               //     // Concatenate the part after "."
-//               //     strcat(new_file_name, dot_pos);
-
-//               //     printf("New file name: %s\n", new_file_name);
-//               // } else {
-//               //     printf("Invalid file name format\n");
-//               // }
-
-//               void deleteSubstring(char *str) {
-//                 // Find the position of the second "-"
-//                 char *firstDash = strchr(str, '-');
-//                 if (firstDash != NULL) {
-//                     char *secondDash = strchr(firstDash + 1, '-');
-//                     if (secondDash != NULL) {
-//                         // Truncate the string at the position of the second "-"
-//                         *secondDash = '\0';
-//                     }
-//                 }
-//               }
-//               char *src = strdup(file_name);
-//               deleteSubstring(src);
-//               // printf("src:%s\n", src);
-//               // free(src);
-
-//               struct queue_entry *q;
-//               afl->current_entry = 0;
-//               for (u32 i = 0; i < afl->queued_items; i++) {
-//                 q = afl->queue_buf[i];
-//                 if (strstr((char *)q->fname, src) != NULL) {
-//                   afl->current_entry = q->id;
-//                   // printf("q->fname:%s\n", q->fname);
-//                   // printf("id:%u\n", q->id);
-//                   break;
-//                 }
-//               }
-//               // printf("\n");
-
-              
-
-
-//               u8 *buf;
-//               buf = afl_realloc((void **)&afl->testcase_buf, len);
-//               int fd = open(path, O_RDONLY);
-//               if (unlikely(fd < 0)) { PFATAL("Unable to open '%s'", path); }
-//               ck_read(fd, buf, len, path);
-//               close(fd);
-
-//               //choose II: run the buf to check if it finds new edges
-//               common_fuzz_stuff(afl, buf, len);
-//           }
-//       } else {
-//           perror("stat");
-//       }
-//   }
-
-//   afl->current_entry = current_entry_bak;
-
-//   char remove_cmd[100];
-//   snprintf(remove_cmd, sizeof(remove_cmd), "rm ./output/mutated_seeds/*");
-//   result = system(remove_cmd);
-//   if (result == 0) {
-//       printf("remove_cmd executed successfully.\n");
-//   } else {
-//       printf("remove_cmd failed with exit code %d.\n", result);
-//   }
-
-//   snprintf(remove_cmd, sizeof(remove_cmd), "rm ./output/mutated_programs/*");
-//   result = system(remove_cmd);
-//   if (result == 0) {
-//       printf("remove_cmd executed successfully.\n");
-//   } else {
-//       printf("remove_cmd failed with exit code %d.\n", result);
-//   }
-// }
-
 u8 run_gen_seeds(afl_state_t * afl, u8 init_flag){
   afl->stage_name = "llmGen";
   afl->stage_short = "llmGen";
 
   char command[1000];
   if (init_flag == 1){
-    printf("\n==== Gen start ====\n");
-    snprintf(command, sizeof(command), "python %s/program_gen.py --output %s --program %s --input %s --mode init >> %s/gen_log", afl->generator_base_path, afl->out_dir, afl->target_program, afl->in_dir, afl->out_dir);
+    // aborted
+    // printf("\n==== Gen start ====\n");
+    // snprintf(command, sizeof(command), "python %s/program_gen.py --output %s --program %s --input %s --mode init >> %s/gen_log", afl->generator_base_path, afl->out_dir, afl->target_program, afl->in_dir, afl->out_dir);
   }else{
     printf("\n==== Gen-M start ====\n");
-    snprintf(command, sizeof(command), "python %s/generator_mutation_gpt_3_5.py --output %s >> %s/mutate_log", afl->generator_base_path, afl->out_dir, afl->out_dir);
+    snprintf(command, sizeof(command), "python %s/generator_mutation.py --output %s >> %s/mutate_log", afl->generator_base_path, afl->out_dir, afl->out_dir);
   }
   
   int result = system(command);
@@ -727,84 +653,6 @@ u8 run_gen_seeds(afl_state_t * afl, u8 init_flag){
   return cnt;
 }
 
-// u8 run_gen_seeds_incre(afl_state_t * afl){
-//   afl->stage_name = "llmGen";
-//   afl->stage_short = "llmGen";
-
-//   char command[1000];
-//   snprintf(command, sizeof(command), "python program_gen.py --output ./output --file_format %s --mode incre >> gen_log", afl->file_format);
-//   int result = system(command);
-//   if (result == 0) {
-//       printf("Command executed successfully.\n");
-//   } else {
-//       printf("Command failed with exit code %d.\n", result);
-//   }
-
-//   // input: dir
-//   // queue_testcase_get
-//   // get buf from dir
-//   DIR *dp;
-//   struct dirent *entry_tmp;
-//   struct stat file_stat;
-//   char *dir = strdup("./output/gen_seeds");
-//   dp = opendir(dir);
-//   if (!dp) {
-//       perror("opendir");
-//       return 1;
-//   }
-
-//   while ((entry_tmp = readdir(dp)) != NULL) {
-//       char path[1024];
-//       snprintf(path, sizeof(path), "%s/%s", dir, entry_tmp->d_name);
-
-//       if (stat(path, &file_stat) == 0) {
-//           if (S_ISREG(file_stat.st_mode)) {
-//               u32 len = (u32)file_stat.st_size;
-//               char *file_name = basename(path);
-//               printf("File: %s, Length: %u bytes\n", file_name, len);
-
-
-//               u8 *buf;
-//               buf = afl_realloc((void **)&afl->testcase_buf, len);
-//               int fd = open(path, O_RDONLY);
-//               if (unlikely(fd < 0)) { PFATAL("Unable to open '%s'", path); }
-//               ck_read(fd, buf, len, path);
-//               close(fd);
-
-//               // common_fuzz_stuff(afl, buf, len);
-
-//               //choose I: directly add to the queue as a new seed that finds new edges
-//               u8 *queue_fn = "";
-//               queue_fn = alloc_printf("%s/queue/id:%06u,time:0,execs:%llu,orig:%s",
-//                         afl->out_dir, afl->queued_items, afl->fsrv.total_execs, file_name);
-//               // queue_fn = alloc_printf(
-//               //     "%s/queue/id:%06u,%s", afl->out_dir, afl->queued_items,
-//               //     describe_op(afl, new_bits, NAME_MAX - strlen("id:000000,")));
-//               // queue_fn = alloc_printf("%s/queue/gen_id_%06u", afl->out_dir, afl->queued_items);
-//               fd = open(queue_fn, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
-//               if (unlikely(fd < 0)) { PFATAL("Unable to create '%s'", queue_fn); }
-//               ck_write(fd, buf, len, queue_fn);
-//               close(fd);
-//               add_to_queue(afl, queue_fn, len, 0);
-
-//               //choose II: run the buf to check if it finds new edges
-//               // common_fuzz_stuff(afl, buf, len);
-//           }
-//       } else {
-//           perror("stat");
-//       }
-//   }
-
-//   char remove_cmd[100];
-//   snprintf(remove_cmd, sizeof(remove_cmd), "rm ./output/gen_seeds/*");
-//   result = system(remove_cmd);
-//   if (result == 0) {
-//       printf("remove_cmd executed successfully.\n");
-//   } else {
-//       printf("remove_cmd failed with exit code %d.\n", result);
-//   }
-// }
-
 /* Main entry point */
 
 int main(int argc, char **argv_orig, char **envp) {
@@ -817,11 +665,28 @@ int main(int argc, char **argv_orig, char **envp) {
   u8  mem_limit_given = 0, exit_1 = 0, debug = 0,
      extras_dir_cnt = 0 /*, have_p = 0*/;
   char  *afl_preload;
+  char  *san_abstraction;
   char  *frida_afl_preload = NULL;
   char **use_argv;
 
   struct timeval  tv;
   struct timezone tz;
+
+  doc_path = access(DOC_PATH, F_OK) != 0 ? (u8 *)"docs" : (u8 *)DOC_PATH;
+
+  if (argc > 1 && strcmp(argv_orig[1], "--version") == 0) {
+
+    printf("afl-fuzz" VERSION "\n");
+    exit(0);
+
+  }
+
+  if (argc > 1 && strcmp(argv_orig[1], "--help") == 0) {
+
+    usage(argv_orig[0], 1);
+    exit(0);
+
+  }
 
   #if defined USE_COLOR && defined ALWAYS_COLORED
   if (getenv("AFL_NO_COLOR") || getenv("AFL_NO_COLOUR")) {
@@ -852,31 +717,105 @@ int main(int argc, char **argv_orig, char **envp) {
   SAYF(cCYA "afl-fuzz" VERSION cRST
             " based on afl by Michal Zalewski and a large online community\n");
 
-  doc_path = access(DOC_PATH, F_OK) != 0 ? (u8 *)"docs" : (u8 *)DOC_PATH;
-
   gettimeofday(&tv, &tz);
   rand_set_seed(afl, tv.tv_sec ^ tv.tv_usec ^ getpid());
 
   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
 
+  // still available: HjJkKqrv
   while (
-      (opt = getopt(
-           argc, argv,
-           "+Ab:B:c:CdDe:E:hi:I:f:F:g:G:l:L:m:M:nNOo:p:RQs:S:t:T:UV:WXx:YZJ:k:")) >
-      0) {
+      (opt = getopt(argc, argv,
+                    "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:l:L:m:M:nNo:Op:P:QRs:S:t:T:"
+                    "uUV:w:WXx:YzZJ:k:")) > 0) {
 
     switch (opt) {
 
+      case 'a':
+
+        if (!stricmp(optarg, "text") || !stricmp(optarg, "ascii") ||
+            !stricmp(optarg, "txt") || !stricmp(optarg, "asc")) {
+
+          afl->input_mode = 1;
+
+        } else if (!stricmp(optarg, "bin") || !stricmp(optarg, "binary")) {
+
+          afl->input_mode = 2;
+
+        } else if (!stricmp(optarg, "def") || !stricmp(optarg, "default")) {
+
+          afl->input_mode = 0;
+
+        } else {
+
+          FATAL("-a input mode needs to be \"text\" or \"binary\".");
+
+        }
+
+        break;
+
+      case 'P':
+        if (!stricmp(optarg, "explore") || !stricmp(optarg, "exploration")) {
+
+          afl->fuzz_mode = 0;
+          afl->switch_fuzz_mode = 0;
+
+        } else if (!stricmp(optarg, "exploit") ||
+
+                   !stricmp(optarg, "exploitation")) {
+
+          afl->fuzz_mode = 1;
+          afl->switch_fuzz_mode = 0;
+
+        } else {
+
+          if ((afl->switch_fuzz_mode = (u32)atoi(optarg)) > INT_MAX) {
+
+            FATAL(
+                "Parameter for option -P must be \"explore\", \"exploit\" or a "
+                "number!");
+
+          } else {
+
+            afl->switch_fuzz_mode *= 1000;
+
+          }
+
+        }
+
+        break;
+
       case 'g':
         afl->min_length = atoi(optarg);
+
+        if (afl->min_length < 1) { afl->min_length = 1; }
+        if (afl->min_length >= MAX_FILE) {
+
+          FATAL("Option -g must be below %lu", (long unsigned int)MAX_FILE);
+
+        }
+
         break;
 
       case 'G':
         afl->max_length = atoi(optarg);
+        if (afl->max_length < 4) { afl->max_length = 4; }
+        if (afl->max_length > MAX_FILE) {
+
+          FATAL(
+              "Option -G max value is %lu, change by editing config.h and "
+              "recompiling afl-fuzz.",
+              (long unsigned int)MAX_FILE);
+
+        }
+
         break;
 
       case 'Z':
         afl->old_seed_selection = 1;
+        break;
+
+      case 'u':
+        afl->use_splicing = 1;
         break;
 
       case 'I':
@@ -899,8 +838,38 @@ int main(int argc, char **argv_orig, char **envp) {
 
       case 'c': {
 
-        afl->shm.cmplog_mode = 1;
-        afl->cmplog_binary = ck_strdup(optarg);
+        if (strcmp(optarg, "-") == 0) {
+
+          if (afl->shm.cmplog_mode) {
+
+            ACTF("Disabling cmplog again because of '-c -'.");
+            afl->shm.cmplog_mode = 0;
+            afl->cmplog_binary = NULL;
+
+          }
+
+        } else {
+
+          afl->shm.cmplog_mode = 1;
+          afl->cmplog_binary = ck_strdup(optarg);
+
+        }
+
+        break;
+
+      }
+
+      case 'w': {
+
+        if (afl->san_binary_length == MAX_EXTRA_SAN_BINARY) {
+
+          FATAL("Only %d extra sanitizer instrumented binaries are supported.",
+                MAX_EXTRA_SAN_BINARY);
+
+        }
+
+        afl->shm.sanfuzz_mode = 1;
+        afl->san_binary[afl->san_binary_length++] = optarg;
         break;
 
       }
@@ -1160,8 +1129,15 @@ int main(int argc, char **argv_orig, char **envp) {
 
         u8 suffix = 'M';
 
-        if (mem_limit_given) { FATAL("Multiple -m options not supported"); }
-        mem_limit_given = 1;
+        if (mem_limit_given) {
+
+          WARNF("Overriding previous -m option.");
+
+        } else {
+
+          mem_limit_given = 1;
+
+        }
 
         if (!optarg) { FATAL("Wrong usage of -m"); }
 
@@ -1198,7 +1174,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
         }
 
-        if (afl->fsrv.mem_limit < 5) { FATAL("Dangerously low value of -m"); }
+        if (afl->fsrv.mem_limit && afl->fsrv.mem_limit < 5) {
+
+          FATAL("Dangerously low value of -m");
+
+        }
 
         if (sizeof(rlim_t) == 4 && afl->fsrv.mem_limit > 2000) {
 
@@ -1210,12 +1190,15 @@ int main(int argc, char **argv_orig, char **envp) {
 
       break;
 
-      case 'D':                                    /* enforce deterministic */
+      case 'd':
+      case 'D':                                        /* old deterministic */
 
-        afl->skip_deterministic = 0;
+        WARNF(
+            "Parameters -d and -D are deprecated, a new enhanced deterministic "
+            "fuzzing is active by default, to disable it use -z");
         break;
 
-      case 'd':                                       /* skip deterministic */
+      case 'z':                                         /* no deterministic */
 
         afl->skip_deterministic = 1;
         break;
@@ -1297,7 +1280,7 @@ int main(int argc, char **argv_orig, char **envp) {
   #else
       case 'X':
       case 'Y':
-        FATAL("Nyx mode is only availabe on linux...");
+        FATAL("Nyx mode is only available on linux...");
         break;
   #endif
       case 'A':                                           /* CoreSight mode */
@@ -1421,9 +1404,17 @@ int main(int argc, char **argv_orig, char **envp) {
             case 'A':
               afl->cmplog_enable_arith = 1;
               break;
+            case 's':
+            case 'S':
+              afl->cmplog_enable_scale = 1;
+              break;
             case 't':
             case 'T':
               afl->cmplog_enable_transform = 1;
+              break;
+            case 'x':
+            case 'X':
+              afl->cmplog_enable_xtreme_transform = 1;
               break;
             case 'r':
             case 'R':
@@ -1473,6 +1464,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
         }
 
+        afl->old_seed_selection = 1;
         u64 limit_time_puppet2 = afl->limit_time_puppet * 60 * 1000;
 
         if ((s32)limit_time_puppet2 < afl->limit_time_puppet) {
@@ -1586,6 +1578,10 @@ int main(int argc, char **argv_orig, char **envp) {
 
         }
 
+        WARNF(
+            "Note that the MOpt mode is not maintained and is not as effective "
+            "as normal havoc mode.");
+
       } break;
 
       case 'h':
@@ -1621,6 +1617,19 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  if (afl->sync_id && strcmp(afl->sync_id, "addseeds") == 0) {
+
+    FATAL("-M/-S name 'addseeds' is a reserved name, choose something else");
+
+  }
+
+  if (afl->is_main_node == 1 && afl->schedule != FAST &&
+      afl->schedule != EXPLORE) {
+
+    FATAL("-M is compatible only with fast and explore -p power schedules");
+
+  }
+
   if (optind == argc || !afl->in_dir || !afl->out_dir || show_help) {
 
     usage(argv[0], show_help);
@@ -1653,30 +1662,22 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (afl->fsrv.mem_limit && afl->shm.cmplog_mode) afl->fsrv.mem_limit += 260;
 
-  OKF("afl++ is maintained by Marc \"van Hauser\" Heuse, Heiko \"hexcoder\" "
-      "Eißfeldt, Andrea Fioraldi and Dominik Maier");
-  OKF("afl++ is open source, get it at "
+  OKF("AFL++ is maintained by Marc \"van Hauser\" Heuse, Dominik Maier, Andrea "
+      "Fioraldi and Heiko \"hexcoder\" Eißfeldt");
+  OKF("AFL++ is open source, get it at "
       "https://github.com/AFLplusplus/AFLplusplus");
-  OKF("NOTE: This is v3.x which changes defaults and behaviours - see "
-      "README.md");
+  OKF("NOTE: AFL++ >= v3 has changed defaults and behaviours - see README.md");
 
   #ifdef __linux__
   if (afl->fsrv.nyx_mode) {
 
-    OKF("afl++ Nyx mode is enabled (developed and mainted by Sergej Schumilo)");
+    OKF("AFL++ Nyx mode is enabled (developed and maintained by Sergej "
+        "Schumilo)");
     OKF("Nyx is open source, get it at https://github.com/Nyx-Fuzz");
 
   }
 
   #endif
-  if (afl->sync_id && afl->is_main_node &&
-      afl->afl_env.afl_custom_mutator_only) {
-
-    WARNF(
-        "Using -M main node with the AFL_CUSTOM_MUTATOR_ONLY mutator options "
-        "will result in no deterministic mutations being done!");
-
-  }
 
   if (afl->fixed_seed) {
 
@@ -1694,15 +1695,16 @@ int main(int argc, char **argv_orig, char **envp) {
 
   #endif
 
-  configure_afl_kill_signals(&afl->fsrv, afl->afl_env.afl_child_kill_signal,
-                             afl->afl_env.afl_fsrv_kill_signal,
-                             (afl->fsrv.qemu_mode || afl->unicorn_mode
+  configure_afl_kill_signals(
+      &afl->fsrv, afl->afl_env.afl_child_kill_signal,
+      afl->afl_env.afl_fsrv_kill_signal,
+      (afl->fsrv.qemu_mode || afl->unicorn_mode || afl->fsrv.use_fauxsrv
   #ifdef __linux__
-                              || afl->fsrv.nyx_mode
+       || afl->fsrv.nyx_mode
   #endif
-                              )
-                                 ? SIGKILL
-                                 : SIGTERM);
+       )
+          ? SIGKILL
+          : SIGTERM);
 
   setup_signal_handlers();
   check_asan_opts(afl);
@@ -1768,17 +1770,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   #endif
 
-  if (afl->sync_id) {
-
-    if (strlen(afl->sync_id) > 24) {
-
-      FATAL("sync_id max length is 24 characters");
-
-    }
-
-    fix_up_sync(afl);
-
-  }
+  if (afl->sync_id) { fix_up_sync(afl); }
 
   if (!strcmp(afl->in_dir, afl->out_dir)) {
 
@@ -1798,7 +1790,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
   setenv("__AFL_OUT_DIR", afl->out_dir, 1);
 
-  if (get_afl_env("AFL_DISABLE_TRIM")) { afl->disable_trim = 1; }
+  if (get_afl_env("AFL_DISABLE_TRIM") || get_afl_env("AFL_NO_TRIM")) {
+
+    afl->disable_trim = 1;
+
+  }
 
   if (getenv("AFL_NO_UI") && getenv("AFL_FORCE_UI")) {
 
@@ -1810,8 +1806,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (!afl->use_banner) { afl->use_banner = argv[optind]; }
 
-  if (afl->shm.cmplog_mode &&
-      (!strcmp("-", afl->cmplog_binary) || !strcmp("0", afl->cmplog_binary))) {
+  if (afl->shm.cmplog_mode && strcmp("0", afl->cmplog_binary) == 0) {
 
     afl->cmplog_binary = strdup(argv[optind]);
 
@@ -1872,22 +1867,35 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  if (afl->cycle_schedules) {
+
+    afl->top_rated_candidates = ck_alloc(map_size * sizeof(u32));
+
+  }
+
+  if (afl->san_binary_length) {
+
+    if (afl->san_abstraction == UNIQUE_TRACE) {
+
+      afl->n_fuzz_dup = ck_alloc(N_FUZZ_SIZE_BITMAP * sizeof(u8));
+
+    }
+
+    if (afl->san_abstraction == SIMPLIFY_TRACE) {
+
+      afl->simplified_n_fuzz = ck_alloc(N_FUZZ_SIZE_BITMAP * sizeof(u8));
+
+    }
+
+  }
+
   if (get_afl_env("AFL_NO_FORKSRV")) { afl->no_forkserver = 1; }
   if (get_afl_env("AFL_NO_CPU_RED")) { afl->no_cpu_meter_red = 1; }
   if (get_afl_env("AFL_NO_ARITH")) { afl->no_arith = 1; }
   if (get_afl_env("AFL_SHUFFLE_QUEUE")) { afl->shuffle_queue = 1; }
   if (get_afl_env("AFL_EXPAND_HAVOC_NOW")) { afl->expand_havoc = 1; }
 
-  if (afl->afl_env.afl_autoresume) {
-
-    afl->autoresume = 1;
-    if (afl->in_place_resume) {
-
-      SAYF("AFL_AUTORESUME has no effect for '-i -'");
-
-    }
-
-  }
+  if (afl->afl_env.afl_autoresume) { afl->autoresume = 1; }
 
   if (afl->afl_env.afl_hang_tmout) {
 
@@ -1996,6 +2004,34 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  // Marker: ADD_TO_INJECTIONS
+  if (getenv("AFL_LLVM_INJECTIONS_ALL") || getenv("AFL_LLVM_INJECTIONS_SQL") ||
+      getenv("AFL_LLVM_INJECTIONS_LDAP") || getenv("AFL_LLVM_INJECTIONS_XSS")) {
+
+    OKF("Adding injection tokens to dictionary.");
+    if (getenv("AFL_LLVM_INJECTIONS_ALL") ||
+        getenv("AFL_LLVM_INJECTIONS_SQL")) {
+
+      add_extra(afl, "'\"\"'", 4);
+
+    }
+
+    if (getenv("AFL_LLVM_INJECTIONS_ALL") ||
+        getenv("AFL_LLVM_INJECTIONS_LDAP")) {
+
+      add_extra(afl, "*)(1=*))(|", 10);
+
+    }
+
+    if (getenv("AFL_LLVM_INJECTIONS_ALL") ||
+        getenv("AFL_LLVM_INJECTIONS_XSS")) {
+
+      add_extra(afl, "1\"><\"", 5);
+
+    }
+
+  }
+
   OKF("Generating fuzz data with a length of min=%u max=%u", afl->min_length,
       afl->max_length);
   u32 min_alloc = MAX(64U, afl->min_length);
@@ -2007,6 +2043,7 @@ int main(int argc, char **argv_orig, char **envp) {
   afl_realloc(AFL_BUF_PARAM(ex), min_alloc);
 
   afl->fsrv.use_fauxsrv = afl->non_instrumented_mode == 1 || afl->no_forkserver;
+  afl->fsrv.max_length = afl->max_length;
 
   #ifdef __linux__
   if (!afl->fsrv.nyx_mode) {
@@ -2029,6 +2066,10 @@ int main(int argc, char **argv_orig, char **envp) {
   #else
   check_crash_handling();
   check_cpu_governor(afl);
+  #endif
+
+  #ifdef __APPLE__
+  setenv("DYLD_NO_PIE", "1", 0);
   #endif
 
   if (getenv("LD_PRELOAD")) {
@@ -2056,6 +2097,15 @@ int main(int argc, char **argv_orig, char **envp) {
 
           OKF("Using Frida Address Sanitizer Mode");
 
+          if (afl->fsrv.mem_limit) {
+
+            WARNF(
+                "in the Frida Address Sanitizer Mode we disable all memory "
+                "limits");
+            afl->fsrv.mem_limit = 0;
+
+          }
+
           fasan_check_afl_preload(afl_preload);
 
           setenv("ASAN_OPTIONS", "detect_leaks=false", 1);
@@ -2069,7 +2119,9 @@ int main(int argc, char **argv_orig, char **envp) {
         ck_free(frida_binary);
 
         setenv("LD_PRELOAD", frida_afl_preload, 1);
+  #ifdef __APPLE__
         setenv("DYLD_INSERT_LIBRARIES", frida_afl_preload, 1);
+  #endif
 
       }
 
@@ -2078,7 +2130,9 @@ int main(int argc, char **argv_orig, char **envp) {
       /* CoreSight mode uses the default behavior. */
 
       setenv("LD_PRELOAD", getenv("AFL_PRELOAD"), 1);
+  #ifdef __APPLE__
       setenv("DYLD_INSERT_LIBRARIES", getenv("AFL_PRELOAD"), 1);
+  #endif
 
     }
 
@@ -2096,7 +2150,9 @@ int main(int argc, char **argv_orig, char **envp) {
       u8 *frida_binary = find_afl_binary(argv[0], "afl-frida-trace.so");
       OKF("Injecting %s ...", frida_binary);
       setenv("LD_PRELOAD", frida_binary, 1);
+  #ifdef __APPLE__
       setenv("DYLD_INSERT_LIBRARIES", frida_binary, 1);
+  #endif
       ck_free(frida_binary);
 
     }
@@ -2120,16 +2176,6 @@ int main(int argc, char **argv_orig, char **envp) {
   check_if_tty(afl);
   if (afl->afl_env.afl_force_ui) { afl->not_on_tty = 0; }
 
-  if (afl->afl_env.afl_custom_mutator_only) {
-
-    /* This ensures we don't proceed to havoc/splice */
-    afl->custom_only = 1;
-
-    /* Ensure we also skip all deterministic steps */
-    afl->skip_deterministic = 1;
-
-  }
-
   get_core_count(afl);
 
   atexit(at_exit);
@@ -2139,6 +2185,15 @@ int main(int argc, char **argv_orig, char **envp) {
   #ifdef HAVE_AFFINITY
   bind_to_free_cpu(afl);
   #endif                                                   /* HAVE_AFFINITY */
+
+  #ifdef __linux__
+  if (afl->fsrv.nyx_mode && afl->fsrv.nyx_bind_cpu_id == 0xFFFFFFFF) {
+
+    afl->fsrv.nyx_bind_cpu_id = 0;
+
+  }
+
+  #endif
 
   #ifdef __HAIKU__
   /* Prioritizes performance over power saving */
@@ -2178,22 +2233,264 @@ int main(int argc, char **argv_orig, char **envp) {
     printf("DEBUG: rand %06d is %u\n", counter, rand_below(afl, 65536));
   #endif
 
+  if (!getenv("AFL_CUSTOM_INFO_PROGRAM")) {
+
+    setenv("AFL_CUSTOM_INFO_PROGRAM", argv[optind], 1);
+
+  }
+
+  if (!getenv("AFL_CUSTOM_INFO_PROGRAM_INPUT") && afl->fsrv.out_file) {
+
+    setenv("AFL_CUSTOM_INFO_PROGRAM_INPUT", afl->fsrv.out_file, 1);
+
+  }
+
+  if (!getenv("AFL_CUSTOM_INFO_PROGRAM_ARGV")) {
+
+    u8 envbuf[8096] = "", tmpbuf[8096] = "";
+    for (s32 i = optind + 1; i < argc; ++i) {
+
+      strcpy(tmpbuf, envbuf);
+      if (strchr(argv[i], ' ') && !strchr(argv[i], '"') &&
+          !strchr(argv[i], '\'')) {
+
+        if (!strchr(argv[i], '\'')) {
+
+          snprintf(envbuf, sizeof(tmpbuf), "%s '%s'", tmpbuf, argv[i]);
+
+        } else {
+
+          snprintf(envbuf, sizeof(tmpbuf), "%s \"%s\"", tmpbuf, argv[i]);
+
+        }
+
+      } else {
+
+        snprintf(envbuf, sizeof(tmpbuf), "%s %s", tmpbuf, argv[i]);
+
+      }
+
+    }
+
+    setenv("AFL_CUSTOM_INFO_PROGRAM_ARGV", envbuf + 1, 1);
+
+  }
+
+  if (!getenv("AFL_CUSTOM_INFO_OUT")) {
+
+    setenv("AFL_CUSTOM_INFO_OUT", afl->out_dir, 1);  // same as __AFL_OUT_DIR
+
+  }
+
   setup_custom_mutators(afl);
 
-  write_setup_file(afl, argc, argv);
+  if (afl->afl_env.afl_custom_mutator_only) {
+
+    if (!afl->custom_mutators_count) {
+
+      if (afl->shm.cmplog_mode) {
+
+        WARNF(
+            "No custom mutator loaded, using AFL_CUSTOM_MUTATOR_ONLY is "
+            "pointless and only allowed now to allow experiments with CMPLOG.");
+
+      } else {
+
+        FATAL(
+            "No custom mutator loaded but AFL_CUSTOM_MUTATOR_ONLY specified.");
+
+      }
+
+    }
+
+    /* This ensures we don't proceed to havoc/splice */
+    afl->custom_only = 1;
+
+    /* Ensure we also skip all deterministic steps */
+    afl->skip_deterministic = 1;
+
+  }
+
+  if (afl->custom_mutators_count && afl->afl_env.afl_custom_mutator_late_send) {
+
+    u32 count_send = 0;
+    LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+      if (el->afl_custom_fuzz_send) {
+
+        if (count_send) {
+
+          FATAL(
+              "You can only have one custom send() function if you are using "
+              "AFL_CUSTOM_MUTATOR_LATE_SEND!");
+
+        }
+
+        afl->fsrv.late_send = el->afl_custom_fuzz_send;
+        afl->fsrv.custom_data_ptr = el->data;
+        count_send = 1;
+
+      }
+
+    });
+
+  }
+
+  if (afl->limit_time_sig > 0 && afl->custom_mutators_count) {
+
+    if (afl->custom_only) {
+
+      FATAL("Custom mutators are incompatible with MOpt (-L)");
+
+    }
+
+    u32 custom_fuzz = 0;
+    LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+      if (el->afl_custom_fuzz) { custom_fuzz = 1; }
+
+    });
+
+    if (custom_fuzz) {
+
+      WARNF("afl_custom_fuzz is incompatible with MOpt (-L)");
+
+    }
+
+  }
+
+  /* Simply code if AFL_TMPDIR is used or not */
+  if (!afl->afl_env.afl_tmpdir) {
+
+    afl->tmp_dir = afl->out_dir;
+
+  } else {
+
+    afl->tmp_dir = afl->afl_env.afl_tmpdir;
+
+  }
 
   setup_cmdline_file(afl, argv + optind);
 
+  // Let's check SAND sanitizers binaries a bit earlier
+  // so that we won't overwrite target_path.
+  // Lazymio: why does cmplog fsrv even work?!
+  for (u8 i = 0; i < afl->san_binary_length; i++) {
+
+    check_binary(afl, afl->san_binary[i]);
+
+  }
+
+  check_binary(afl, argv[optind]);
+
+  u64 prev_target_hash = 0;
+  s32 fast_resume = 0;
+  #ifdef HAVE_ZLIB
+  gzFile fr_fd = NULL;
+  #else
+  s32 fr_fd = -1;
+  #endif
+
+  if (afl->in_place_resume && !afl->afl_env.afl_no_fastresume) {
+
+    u8 fn[PATH_MAX], buf[32];
+    snprintf(fn, PATH_MAX, "%s/target_hash", afl->out_dir);
+    s32 fd = open(fn, O_RDONLY);
+    if (fd >= 0) {
+
+      if (read(fd, buf, 32) >= 16) {
+
+        sscanf(buf, "%p", (void **)&prev_target_hash);
+
+      }
+
+      close(fd);
+
+    }
+
+  }
+
+  write_setup_file(afl, argc, argv);
+
+  if (afl->in_place_resume && !afl->afl_env.afl_no_fastresume) {
+
+  #ifdef __linux__
+    u64 target_hash = 0;
+    if (afl->fsrv.nyx_mode) {
+
+      nyx_load_target_hash(&afl->fsrv);
+      target_hash = afl->fsrv.nyx_target_hash64;
+
+    } else {
+
+      target_hash = get_binary_hash(afl->fsrv.target_path);
+
+    }
+
+  #else
+    u64 target_hash = get_binary_hash(afl->fsrv.target_path);
+  #endif
+
+    if ((!target_hash || prev_target_hash != target_hash)
+  #ifdef __linux__
+        || (afl->fsrv.nyx_mode && target_hash == 0)
+  #endif
+    ) {
+
+      ACTF("Target binary is different, cannot perform FAST RESUME!");
+
+    } else {
+
+      u8 fn[PATH_MAX];
+      snprintf(fn, PATH_MAX, "%s/fastresume.bin", afl->out_dir);
+  #ifdef HAVE_ZLIB
+      if ((fr_fd = ZLIBOPEN(fn, "rb")) != NULL) {
+
+  #else
+      if ((fr_fd = open(fn, O_RDONLY)) >= 0) {
+
+  #endif
+
+        u8   ver_string[8];
+        u64 *ver = (u64 *)ver_string;
+        u64  expect_ver = FAST_RESUME_VERSION + afl->shm.cmplog_mode +
+                         (sizeof(struct queue_entry) << 1);
+
+        if (NZLIBREAD(fr_fd, ver_string, sizeof(ver_string)) !=
+            sizeof(ver_string))
+          WARNF("Empty fastresume.bin, ignoring, cannot perform FAST RESUME");
+        else if (expect_ver != *ver)
+          WARNF(
+              "Different AFL++ version or feature usage, cannot perform FAST "
+              "RESUME");
+        else {
+
+          OKF("Will perform FAST RESUME");
+          fast_resume = 1;
+
+        }
+
+      } else {
+
+        ACTF("fastresume.bin not found, cannot perform FAST RESUME!");
+
+      }
+
+      // If the fast resume file is not valid we will be unable to start, so
+      // we remove the file but keep the file descriptor open.
+      unlink(fn);
+
+    }
+
+  }
+
   read_testcases(afl, NULL);
-  // read_foreign_testcases(afl, 1); for the moment dont do this
-  OKF("Loaded a total of %u seeds.", afl->queued_items);
 
   pivot_inputs(afl);
 
   if (!afl->timeout_given) { find_timeout(afl); }  // only for resumes!
 
-  if ((afl->tmp_dir = afl->afl_env.afl_tmpdir) != NULL &&
-      !afl->in_place_resume) {
+  if (afl->afl_env.afl_tmpdir && !afl->in_place_resume) {
 
     char tmpfile[PATH_MAX];
 
@@ -2218,11 +2515,10 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-  } else {
-
-    afl->tmp_dir = afl->out_dir;
-
   }
+
+  // read_foreign_testcases(afl, 1); for the moment dont do this
+  OKF("Loaded a total of %u seeds.", afl->queued_items);
 
   /* If we don't have a file name chosen yet, use a safe default. */
 
@@ -2280,20 +2576,19 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  check_binary(afl, argv[optind]);
-
   #ifdef AFL_PERSISTENT_RECORD
   if (unlikely(afl->fsrv.persistent_record)) {
 
-    if (!getenv(PERSIST_ENV_VAR)) {
+    if (!getenv(PERSIST_ENV_VAR) && !getenv("AFL_FRIDA_PERSISTENT_ADDR") &&
+        !getenv("AFL_QEMU_PERSISTENT_ADDR")) {
 
       FATAL(
-          "Target binary is not compiled in persistent mode, "
+          "Target binary is not compiled/run in persistent mode, "
           "AFL_PERSISTENT_RECORD makes no sense.");
 
     }
 
-    afl->fsrv.persistent_record_dir = alloc_printf("%s/crashes", afl->out_dir);
+    afl->fsrv.persistent_record_dir = alloc_printf("%s", afl->out_dir);
 
   }
 
@@ -2331,6 +2626,7 @@ int main(int argc, char **argv_orig, char **envp) {
   if (afl->non_instrumented_mode || afl->fsrv.qemu_mode ||
       afl->fsrv.frida_mode || afl->fsrv.cs_mode || afl->unicorn_mode) {
 
+    u32 old_map_size = map_size;
     map_size = afl->fsrv.real_map_size = afl->fsrv.map_size = MAP_SIZE;
     afl->virgin_bits = ck_realloc(afl->virgin_bits, map_size);
     afl->virgin_tmout = ck_realloc(afl->virgin_tmout, map_size);
@@ -2341,6 +2637,18 @@ int main(int argc, char **argv_orig, char **envp) {
     afl->clean_trace_custom = ck_realloc(afl->clean_trace_custom, map_size);
     afl->first_trace = ck_realloc(afl->first_trace, map_size);
     afl->map_tmp_buf = ck_realloc(afl->map_tmp_buf, map_size);
+
+    if (old_map_size < map_size) {
+
+      memset(afl->var_bytes + old_map_size, 0, map_size - old_map_size);
+      memset(afl->top_rated + old_map_size, 0, map_size - old_map_size);
+      memset(afl->clean_trace + old_map_size, 0, map_size - old_map_size);
+      memset(afl->clean_trace_custom + old_map_size, 0,
+             map_size - old_map_size);
+      memset(afl->first_trace + old_map_size, 0, map_size - old_map_size);
+      memset(afl->map_tmp_buf + old_map_size, 0, map_size - old_map_size);
+
+    }
 
   }
 
@@ -2369,6 +2677,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
       OKF("Re-initializing maps to %u bytes", new_map_size);
 
+      u32 old_map_size = map_size;
       afl->virgin_bits = ck_realloc(afl->virgin_bits, new_map_size);
       afl->virgin_tmout = ck_realloc(afl->virgin_tmout, new_map_size);
       afl->virgin_crash = ck_realloc(afl->virgin_crash, new_map_size);
@@ -2380,6 +2689,18 @@ int main(int argc, char **argv_orig, char **envp) {
           ck_realloc(afl->clean_trace_custom, new_map_size);
       afl->first_trace = ck_realloc(afl->first_trace, new_map_size);
       afl->map_tmp_buf = ck_realloc(afl->map_tmp_buf, new_map_size);
+
+      if (old_map_size < new_map_size) {
+
+        memset(afl->var_bytes + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->top_rated + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->clean_trace + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->clean_trace_custom + old_map_size, 0,
+               new_map_size - old_map_size);
+        memset(afl->first_trace + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->map_tmp_buf + old_map_size, 0, new_map_size - old_map_size);
+
+      }
 
       afl_fsrv_kill(&afl->fsrv);
       afl_shm_deinit(&afl->shm);
@@ -2396,6 +2717,129 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  san_abstraction = getenv("AFL_SAN_ABSTRACTION");
+  if (!san_abstraction || !strcmp(san_abstraction, "simplify_trace")) {
+
+    afl->san_abstraction = SIMPLIFY_TRACE;
+
+  } else if (!strcmp(san_abstraction, "coverage_increase")) {
+
+    afl->san_abstraction = COVERAGE_INCREASE;
+
+  } else if (!strcmp(san_abstraction, "unique_trace")) {
+
+    afl->san_abstraction = UNIQUE_TRACE;
+
+  } else {
+
+    WARNF("Unknown abstraction: %s, fallback to simplified trace.\n",
+          san_abstraction);
+    afl->san_abstraction = SIMPLIFY_TRACE;
+
+  }
+
+  if (!afl->san_binary_length && san_abstraction) {
+
+    WARNF(
+        "No extra sanitizer instrumented binaries are given, do you forget "
+        "-a?\n");
+
+  }
+
+  /* Maybe merge with cmplog but much cmplog code was already copy-paste
+   * style... */
+  if (afl->san_binary_length) {
+
+    for (u8 i = 0; i < afl->san_binary_length; i++) {
+
+      ACTF("Spawning SAND forkserver for %s", afl->san_binary[i]);
+      afl_fsrv_init_dup(&afl->san_fsrvs[i], &afl->fsrv);
+
+      /*
+       * We don't really collect trace bits for sanitizer instrumented binary so
+       * we just allocate some dummy memory here.
+       */
+      afl->san_fsrvs[i].trace_bits = ck_alloc(
+          afl->fsrv.map_size + 8); /* One more u64 according to afl_shm_init*/
+      afl->san_fsrvs[i].map_size = afl->fsrv.map_size;
+      afl->san_fsrvs[i].san_but_not_instrumented = 1;
+
+      afl->san_fsrvs[i].cs_mode = afl->fsrv.cs_mode;
+      afl->san_fsrvs[i].qemu_mode = afl->fsrv.qemu_mode;
+      afl->san_fsrvs[i].frida_mode = afl->fsrv.frida_mode;
+      afl->san_fsrvs[i].asanfuzz_binary = afl->san_binary[i];
+      afl->san_fsrvs[i].target_path = afl->san_binary[i];
+      afl->san_fsrvs[i].init_child_func = sanfuzz_exec_child;
+
+      afl->san_fsrvs[i].child_kill_signal =
+          afl->fsrv.child_kill_signal;  // I believe cmplog also needs this.
+      afl->san_fsrvs[i].fsrv_kill_signal = afl->fsrv.fsrv_kill_signal;
+
+      if ((map_size <= DEFAULT_SHMEM_SIZE ||
+           afl->san_fsrvs[i].map_size < map_size) &&
+          !afl->non_instrumented_mode && !afl->fsrv.qemu_mode &&
+          !afl->fsrv.frida_mode && !afl->unicorn_mode && !afl->fsrv.cs_mode &&
+          !afl->afl_env.afl_skip_bin_check) {
+
+        afl->san_fsrvs[i].map_size = MAX(map_size, (u32)DEFAULT_SHMEM_SIZE);
+        char vbuf[16];
+        snprintf(vbuf, sizeof(vbuf), "%u", afl->san_fsrvs[i].map_size);
+        setenv("AFL_MAP_SIZE", vbuf, 1);
+
+      }
+
+      u32 new_map_size =
+          afl_fsrv_get_mapsize(&afl->san_fsrvs[i], afl->argv, &afl->stop_soon,
+                               afl->afl_env.afl_debug_child);
+
+      // only reinitialize when it needs to be larger
+      if (map_size < new_map_size) {
+
+        OKF("Re-initializing maps to %u bytes due to SAN instrumented binary",
+            new_map_size);
+
+        afl->virgin_bits = ck_realloc(afl->virgin_bits, new_map_size);
+        afl->virgin_tmout = ck_realloc(afl->virgin_tmout, new_map_size);
+        afl->virgin_crash = ck_realloc(afl->virgin_crash, new_map_size);
+        afl->var_bytes = ck_realloc(afl->var_bytes, new_map_size);
+        afl->top_rated =
+            ck_realloc(afl->top_rated, new_map_size * sizeof(void *));
+        afl->clean_trace = ck_realloc(afl->clean_trace, new_map_size);
+        afl->clean_trace_custom =
+            ck_realloc(afl->clean_trace_custom, new_map_size);
+        afl->first_trace = ck_realloc(afl->first_trace, new_map_size);
+        afl->map_tmp_buf = ck_realloc(afl->map_tmp_buf, new_map_size);
+
+        afl_fsrv_kill(&afl->fsrv);
+        afl_fsrv_kill(&afl->san_fsrvs[i]);
+        afl_shm_deinit(&afl->shm);
+
+        afl->san_fsrvs[i].map_size = new_map_size;  // non-cmplog stays the same
+        map_size = new_map_size;
+
+        setenv("AFL_NO_AUTODICT", "1", 1);  // loaded already
+        afl->fsrv.trace_bits =
+            afl_shm_init(&afl->shm, new_map_size, afl->non_instrumented_mode);
+        ck_free(afl->san_fsrvs[i].trace_bits);
+        afl->san_fsrvs[i].trace_bits = ck_alloc(afl->fsrv.map_size + 8);
+        afl->san_fsrvs[i].map_size = afl->fsrv.map_size;
+        afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
+                       afl->afl_env.afl_debug_child);
+        afl_fsrv_start(&afl->san_fsrvs[i], afl->argv, &afl->stop_soon,
+                       afl->afl_env.afl_debug_child);
+
+      }
+
+      OKF("SAND forkserver for %s successfully started", afl->san_binary[i]);
+
+    }
+
+    OKF("All forkservers for extra sanitizers instrumented binares are up and "
+        "we have abstraction = %d",
+        afl->san_abstraction);
+
+  }
+
   if (afl->cmplog_binary) {
 
     ACTF("Spawning cmplog forkserver");
@@ -2406,6 +2850,7 @@ int main(int argc, char **argv_orig, char **envp) {
     afl->cmplog_fsrv.qemu_mode = afl->fsrv.qemu_mode;
     afl->cmplog_fsrv.frida_mode = afl->fsrv.frida_mode;
     afl->cmplog_fsrv.cmplog_binary = afl->cmplog_binary;
+    afl->cmplog_fsrv.target_path = afl->fsrv.target_path;
     afl->cmplog_fsrv.init_child_func = cmplog_exec_child;
 
     if ((map_size <= DEFAULT_SHMEM_SIZE ||
@@ -2430,6 +2875,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
       OKF("Re-initializing maps to %u bytes due cmplog", new_map_size);
 
+      u32 old_map_size = map_size;
       afl->virgin_bits = ck_realloc(afl->virgin_bits, new_map_size);
       afl->virgin_tmout = ck_realloc(afl->virgin_tmout, new_map_size);
       afl->virgin_crash = ck_realloc(afl->virgin_crash, new_map_size);
@@ -2441,6 +2887,18 @@ int main(int argc, char **argv_orig, char **envp) {
           ck_realloc(afl->clean_trace_custom, new_map_size);
       afl->first_trace = ck_realloc(afl->first_trace, new_map_size);
       afl->map_tmp_buf = ck_realloc(afl->map_tmp_buf, new_map_size);
+
+      if (old_map_size < new_map_size) {
+
+        memset(afl->var_bytes + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->top_rated + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->clean_trace + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->clean_trace_custom + old_map_size, 0,
+               new_map_size - old_map_size);
+        memset(afl->first_trace + old_map_size, 0, new_map_size - old_map_size);
+        memset(afl->map_tmp_buf + old_map_size, 0, new_map_size - old_map_size);
+
+      }
 
       afl_fsrv_kill(&afl->fsrv);
       afl_fsrv_kill(&afl->cmplog_fsrv);
@@ -2460,7 +2918,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    OKF("Cmplog forkserver successfully started");
+    OKF("CMPLOG forkserver successfully started");
 
   }
 
@@ -2478,8 +2936,12 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (afl->fsrv.out_file && afl->fsrv.use_shmem_fuzz) {
 
+    unlink(afl->fsrv.out_file);
     afl->fsrv.out_file = NULL;
     afl->fsrv.use_stdin = 0;
+    close(afl->fsrv.out_fd);
+    afl->fsrv.out_fd = -1;
+
     if (!afl->unicorn_mode && !afl->fsrv.use_stdin && !default_output) {
 
       WARNF(
@@ -2494,31 +2956,103 @@ int main(int argc, char **argv_orig, char **envp) {
   dedup_extras(afl);
   if (afl->extras_cnt) { OKF("Loaded a total of %u extras.", afl->extras_cnt); }
 
-  // after we have the correct bitmap size we can read the bitmap -B option
-  // and set the virgin maps
-  if (afl->in_bitmap) {
+  if (unlikely(fast_resume)) {
 
-    read_bitmap(afl->in_bitmap, afl->virgin_bits, afl->fsrv.map_size);
+    u64 resume_start = get_cur_time_us();
+    // if we get here then we should abort on errors
+    ZLIBREAD(fr_fd, afl->virgin_bits, afl->fsrv.map_size, "virgin_bits");
+    ZLIBREAD(fr_fd, afl->virgin_tmout, afl->fsrv.map_size, "virgin_tmout");
+    ZLIBREAD(fr_fd, afl->virgin_crash, afl->fsrv.map_size, "virgin_crash");
+    ZLIBREAD(fr_fd, afl->var_bytes, afl->fsrv.map_size, "var_bytes");
+
+    u8                  res[1] = {0};
+    u8                 *o_start = (u8 *)&(afl->queue_buf[0]->colorized);
+    u8                 *o_end = (u8 *)&(afl->queue_buf[0]->mother);
+    u32                 r = 8 + afl->fsrv.map_size * 4;
+    u32                 q_len = o_end - o_start;
+    u32                 m_len = ((afl->fsrv.map_size + 7) >> 3);
+    struct queue_entry *q;
+
+    for (u32 i = 0; i < afl->queued_items; i++) {
+
+      q = afl->queue_buf[i];
+      // this is very dirty and assumes nice memory :-)
+      ZLIBREAD(fr_fd, (u8 *)&(q->colorized), q_len, "queue data");
+      ZLIBREAD(fr_fd, res, 1, "check map");
+      if (res[0]) {
+
+        q->trace_mini = ck_alloc(m_len);
+        ZLIBREAD(fr_fd, q->trace_mini, m_len, "trace_mini");
+        r += q_len + m_len + 1;
+
+      } else {
+
+        r += q_len + 1;
+
+      }
+
+      afl->total_bitmap_size += q->bitmap_size;
+      ++afl->total_bitmap_entries;
+      update_bitmap_score(afl, q, false);
+
+      if (q->was_fuzzed) { --afl->pending_not_fuzzed; }
+
+      if (q->disabled) {
+
+        if (!q->was_fuzzed) { --afl->pending_not_fuzzed; }
+        --afl->active_items;
+
+      }
+
+      if (q->var_behavior) { ++afl->queued_variable; }
+      if (q->favored) {
+
+        ++afl->queued_favored;
+        if (!q->was_fuzzed) { ++afl->pending_favored; }
+
+      }
+
+    }
+
+    u8 buf[4];
+    if (NZLIBREAD(fr_fd, buf, 3) > 0) {
+
+      FATAL("invalid trailing data in fastresume.bin");
+
+    }
+
+    OKF("Successfully loaded fastresume.bin (%u bytes)!", r);
+    ZLIBCLOSE(fr_fd);
+    afl->reinit_table = 1;
+    update_calibration_time(afl, &resume_start);
 
   } else {
 
-    memset(afl->virgin_bits, 255, map_size);
+    // after we have the correct bitmap size we can read the bitmap -B option
+    // and set the virgin maps
+    if (afl->in_bitmap) {
 
-  }
+      read_bitmap(afl->in_bitmap, afl->virgin_bits, afl->fsrv.map_size);
 
-  memset(afl->virgin_tmout, 255, map_size);
-  memset(afl->virgin_crash, 255, map_size);
+    } else {
 
-  if (likely(!afl->afl_env.afl_no_startup_calibration)) {
+      memset(afl->virgin_bits, 255, map_size);
 
-    // run_gen_seeds(afl, 1);
+    }
 
-    perform_dry_run(afl);
+    memset(afl->virgin_tmout, 255, map_size);
+    memset(afl->virgin_crash, 255, map_size);
 
-  } else {
+    if (likely(!afl->afl_env.afl_no_startup_calibration)) {
 
-    ACTF("skipping initial seed calibration due option override");
-    usleep(1000);
+      perform_dry_run(afl);
+
+    } else {
+
+      ACTF("Skipping initial seed calibration due option override!");
+      usleep(1000);
+
+    }
 
   }
 
@@ -2537,16 +3071,8 @@ int main(int argc, char **argv_orig, char **envp) {
   for (entry = 0; entry < afl->queued_items; ++entry)
     if (!afl->queue_buf[entry]->disabled) { ++valid_seeds; }
 
-  if (!afl->pending_not_fuzzed || !valid_seeds) {
+  if (!valid_seeds) {
 
-  #ifdef __linux__
-    if (afl->fsrv.nyx_mode) {
-
-      afl->fsrv.nyx_handlers->nyx_shutdown(afl->fsrv.nyx_runner);
-
-    }
-
-  #endif
     FATAL("We need at least one valid input seed that does not crash!");
 
   }
@@ -2566,10 +3092,18 @@ int main(int argc, char **argv_orig, char **envp) {
 
       for (entry = 0; entry < afl->queued_items; ++entry)
         if (!afl->queue_buf[entry]->disabled)
-          if (afl->queue_buf[entry]->exec_us > max_ms)
-            max_ms = afl->queue_buf[entry]->exec_us;
+          if ((afl->queue_buf[entry]->exec_us / 1000) > max_ms)
+            max_ms = afl->queue_buf[entry]->exec_us / 1000;
+
+      // Add 20% as a safety margin, capped to exec_tmout given in -t option
+      max_ms *= 1.2;
+      if (max_ms > afl->fsrv.exec_tmout) max_ms = afl->fsrv.exec_tmout;
+
+      // Ensure that there is a sensible timeout even for very fast binaries
+      if (max_ms < 5) max_ms = 5;
 
       afl->fsrv.exec_tmout = max_ms;
+      afl->timeout_given = 1;
 
     }
 
@@ -2602,11 +3136,9 @@ int main(int argc, char **argv_orig, char **envp) {
   }
 
   // (void)nice(-20);  // does not improve the speed
-  // real start time, we reset, so this works correctly with -V
-  afl->start_time = get_cur_time();
 
   #ifdef INTROSPECTION
-  u32 prev_saved_crashes = 0, prev_saved_tmouts = 0;
+  u32 prev_saved_crashes = 0, prev_saved_tmouts = 0, stat_prev_queued_items = 0;
   #endif
   u32 prev_queued_items = 0, runs_in_current_cycle = (u32)-1;
   u8  skipped_fuzz;
@@ -2628,6 +3160,9 @@ int main(int argc, char **argv_orig, char **envp) {
   u64 gen_last_update = get_cur_time();
   u64 use_time = 0;
 
+  // real start time, we reset, so this works correctly with -V
+  afl->start_time = get_cur_time();
+
   while (likely(!afl->stop_soon)) {
 
     cull_queue(afl);
@@ -2640,7 +3175,7 @@ int main(int argc, char **argv_orig, char **envp) {
                     (!afl->queue_cycle && afl->afl_env.afl_import_first)) &&
                    afl->sync_id)) {
 
-        if (!afl->queue_cycle && afl->afl_env.afl_import_first) {
+        if (unlikely(!afl->queue_cycle && afl->afl_env.afl_import_first)) {
 
           OKF("Syncing queues from other fuzzer instances first ...");
 
@@ -2651,6 +3186,12 @@ int main(int argc, char **argv_orig, char **envp) {
       }
 
       ++afl->queue_cycle;
+      if (afl->afl_env.afl_no_ui) {
+
+        ACTF("Entering queue cycle %llu\n", afl->queue_cycle);
+
+      }
+
       runs_in_current_cycle = (u32)-1;
       afl->cur_skipped_items = 0;
 
@@ -2659,7 +3200,7 @@ int main(int argc, char **argv_orig, char **envp) {
       // queue is fully cycled.
       time_t     cursec = time(NULL);
       struct tm *curdate = localtime(&cursec);
-      if (likely(!afl->afl_env.afl_pizza_mode)) {
+      if (unlikely(!afl->afl_env.afl_pizza_mode)) {
 
         if (unlikely(curdate->tm_mon == 3 && curdate->tm_mday == 1)) {
 
@@ -2704,13 +3245,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
       }
 
-      if (unlikely(afl->not_on_tty)) {
-
-        ACTF("Entering queue cycle %llu.", afl->queue_cycle);
-        fflush(stdout);
-
-      }
-
       /* If we had a full queue cycle with no new finds, try
          recombination strategies next. */
 
@@ -2719,66 +3253,55 @@ int main(int argc, char **argv_orig, char **envp) {
                       3600 */
                    )) {
 
-        if (afl->use_splicing) {
+        ++afl->cycles_wo_finds;
 
-          ++afl->cycles_wo_finds;
+        if (unlikely(afl->shm.cmplog_mode &&
+                     afl->cmplog_max_filesize < MAX_FILE)) {
 
-          if (unlikely(afl->shm.cmplog_mode &&
-                       afl->cmplog_max_filesize < MAX_FILE)) {
+          afl->cmplog_max_filesize <<= 4;
 
-            afl->cmplog_max_filesize <<= 4;
+        }
 
-          }
+        switch (afl->expand_havoc) {
 
-          switch (afl->expand_havoc) {
+          case 0:
+            // do nothing the first time
+            afl->expand_havoc = 1;
+            break;
+          case 1:
+            // add MOpt mutator
+            /*
+            if (afl->limit_time_sig == 0 && !afl->custom_only &&
+                !afl->python_only) {
 
-            case 0:
-              // this adds extra splicing mutation options to havoc mode
-              afl->expand_havoc = 1;
-              break;
-            case 1:
-              // add MOpt mutator
-              /*
-              if (afl->limit_time_sig == 0 && !afl->custom_only &&
-                  !afl->python_only) {
+              afl->limit_time_sig = -1;
+              afl->limit_time_puppet = 0;
 
-                afl->limit_time_sig = -1;
-                afl->limit_time_puppet = 0;
+            }
 
-              }
-
-              */
-              afl->expand_havoc = 2;
-              if (afl->cmplog_lvl && afl->cmplog_lvl < 2) afl->cmplog_lvl = 2;
-              break;
-            case 2:
-              // increase havoc mutations per fuzz attempt
-              afl->havoc_stack_pow2++;
-              afl->expand_havoc = 3;
-              break;
-            case 3:
-              // further increase havoc mutations per fuzz attempt
-              afl->havoc_stack_pow2++;
-              afl->expand_havoc = 4;
-              break;
-            case 4:
-              afl->expand_havoc = 5;
-              // if (afl->cmplog_lvl && afl->cmplog_lvl < 3) afl->cmplog_lvl =
-              // 3;
-              break;
-            case 5:
-              // nothing else currently
-              break;
-
-          }
-
-        } else {
-
-  #ifndef NO_SPLICING
-          afl->use_splicing = 1;
-  #else
-          afl->use_splicing = 0;
-  #endif
+            */
+            /* increase cmplog level to 2 if we run with level 1 */
+            if (afl->cmplog_lvl && afl->cmplog_lvl < 2) afl->cmplog_lvl = 2;
+            afl->expand_havoc = 2;
+            break;
+          case 2:
+            // increase havoc mutations per fuzz attempt
+            afl->havoc_stack_pow2++;
+            afl->expand_havoc = 3;
+            break;
+          case 3:
+            // further increase havoc mutations per fuzz attempt
+            afl->havoc_stack_pow2++;
+            afl->expand_havoc = 4;
+            break;
+          case 4:
+            // if (afl->cmplog_lvl && afl->cmplog_lvl < 3) afl->cmplog_lvl =
+            // 3;
+            afl->expand_havoc = 5;
+            break;
+          case 5:
+            // nothing else currently
+            break;
 
         }
 
@@ -2789,10 +3312,22 @@ int main(int argc, char **argv_orig, char **envp) {
       }
 
   #ifdef INTROSPECTION
-      fprintf(afl->introspection_file,
-              "CYCLE cycle=%llu cycle_wo_finds=%llu expand_havoc=%u queue=%u\n",
-              afl->queue_cycle, afl->cycles_wo_finds, afl->expand_havoc,
-              afl->queued_items);
+      {
+
+        u64 cur_time = get_cur_time();
+        fprintf(afl->introspection_file,
+                "CYCLE cycle=%llu cycle_wo_finds=%llu time_wo_finds=%llu "
+                "expand_havoc=%u queue=%u\n",
+                afl->queue_cycle, afl->cycles_wo_finds,
+                afl->longest_find_time > cur_time - afl->last_find_time
+                    ? afl->longest_find_time / 1000
+                    : ((afl->start_time == 0 || afl->last_find_time == 0)
+                           ? 0
+                           : (cur_time - afl->last_find_time) / 1000),
+                afl->expand_havoc, afl->queued_items);
+
+      }
+
   #endif
 
       if (afl->cycle_schedules) {
@@ -2832,15 +3367,7 @@ int main(int argc, char **argv_orig, char **envp) {
         }
 
         // we must recalculate the scores of all queue entries
-        for (u32 i = 0; i < afl->queued_items; i++) {
-
-          if (likely(!afl->queue_buf[i]->disabled)) {
-
-            update_bitmap_score(afl, afl->queue_buf[i]);
-
-          }
-
-        }
+        recalculate_all_scores(afl);
 
       }
 
@@ -2923,42 +3450,75 @@ int main(int argc, char **argv_orig, char **envp) {
       // printf("=========== end ============\n"); 
       
     }else{
-        do {
+
+      do {
 
         if (likely(!afl->old_seed_selection)) {
 
-          if (unlikely(prev_queued_items < afl->queued_items ||
-                      afl->reinit_table)) {
+          if (likely(afl->pending_favored && afl->smallest_favored >= 0)) {
 
-            // we have new queue entries since the last run, recreate alias table
-            prev_queued_items = afl->queued_items;
-            create_alias_table(afl);
+            afl->current_entry = afl->smallest_favored;
+
+            /*
+
+                      } else {
+
+                        for (s32 iter = afl->queued_items - 1; iter >= 0; --iter)
+              {
+
+                          if (unlikely(afl->queue_buf[iter]->favored &&
+                                      !afl->queue_buf[iter]->was_fuzzed)) {
+
+                            afl->current_entry = iter;
+                            break;
+
+                          }
+
+                        }
+
+            */
+
+            afl->queue_cur = afl->queue_buf[afl->current_entry];
+
+          } else {
+
+            if (unlikely(prev_queued_items < afl->queued_items ||
+                        afl->reinit_table)) {
+
+              // we have new queue entries since the last run, recreate alias
+              // table
+              prev_queued_items = afl->queued_items;
+              create_alias_table(afl);
+
+            }
+
+            do {
+
+              afl->current_entry = select_next_queue_entry(afl);
+
+            } while (unlikely(afl->current_entry >= afl->queued_items));
+
+            afl->queue_cur = afl->queue_buf[afl->current_entry];
 
           }
-
-          do {
-
-            afl->current_entry = select_next_queue_entry(afl);
-
-          } while (unlikely(afl->current_entry >= afl->queued_items));
-
-          afl->queue_cur = afl->queue_buf[afl->current_entry];
 
         }
 
         skipped_fuzz = fuzz_one(afl);
     #ifdef INTROSPECTION
         ++afl->queue_cur->stats_selected;
+
         if (unlikely(skipped_fuzz)) {
 
           ++afl->queue_cur->stats_skipped;
 
         } else {
 
-          if (unlikely(afl->queued_items > prev_queued_items)) {
+          if (unlikely(afl->queued_items > stat_prev_queued_items)) {
 
-            afl->queue_cur->stats_finds += afl->queued_items - prev_queued_items;
-            prev_queued_items = afl->queued_items;
+            afl->queue_cur->stats_finds +=
+                afl->queued_items - stat_prev_queued_items;
+            stat_prev_queued_items = afl->queued_items;
 
           }
 
@@ -3004,30 +3564,36 @@ int main(int argc, char **argv_orig, char **envp) {
       } while (skipped_fuzz && afl->queue_cur && !afl->stop_soon);
     }
 
-    
+    u64 cur_time = get_cur_time();
+
+    if (likely(afl->switch_fuzz_mode && afl->fuzz_mode == 0 &&
+               !afl->non_instrumented_mode) &&
+        unlikely(cur_time > (likely(afl->last_find_time) ? afl->last_find_time
+                                                         : afl->start_time) +
+                                afl->switch_fuzz_mode)) {
+
+      if (afl->afl_env.afl_no_ui) {
+
+        ACTF(
+            "No new coverage found for %llu seconds, switching to exploitation "
+            "strategy.",
+            afl->switch_fuzz_mode / 1000);
+
+      }
+
+      afl->fuzz_mode = 1;
+
+    }
 
     if (likely(!afl->stop_soon && afl->sync_id)) {
 
-      if (likely(afl->skip_deterministic)) {
+      if (unlikely(afl->is_main_node)) {
 
-        if (unlikely(afl->is_main_node)) {
+        if (unlikely(cur_time > (afl->sync_time >> 1) + afl->last_sync_time)) {
 
-          if (unlikely(get_cur_time() >
-                       (afl->sync_time >> 1) + afl->last_sync_time)) {
+          if (!(sync_interval_cnt++ % (SYNC_INTERVAL / 3))) {
 
-            if (!(sync_interval_cnt++ % (SYNC_INTERVAL / 3))) {
-
-              sync_fuzzers(afl);
-
-            }
-
-          }
-
-        } else {
-
-          if (unlikely(get_cur_time() > afl->sync_time + afl->last_sync_time)) {
-
-            if (!(sync_interval_cnt++ % SYNC_INTERVAL)) { sync_fuzzers(afl); }
+            sync_fuzzers(afl);
 
           }
 
@@ -3035,7 +3601,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
       } else {
 
-        sync_fuzzers(afl);
+        if (unlikely(cur_time > afl->sync_time + afl->last_sync_time)) {
+
+          if (!(sync_interval_cnt++ % SYNC_INTERVAL)) { sync_fuzzers(afl); }
+
+        }
 
       }
 
@@ -3050,6 +3620,28 @@ stop_fuzzing:
   show_stats(afl);           // print the screen one last time
   write_bitmap(afl);
   save_auto(afl);
+
+  #ifdef __AFL_CODE_COVERAGE
+  if (afl->fsrv.persistent_trace_bits) {
+
+    char cfn[4096];
+    snprintf(cfn, sizeof(cfn), "%s/covmap.dump", afl->out_dir);
+
+    FILE *cov_fd;
+    if ((cov_fd = fopen(cfn, "w")) == NULL) {
+
+      PFATAL("could not create '%s'", cfn);
+
+    }
+
+    // Write the real map size, as the map size must exactly match the pointer
+    // map in length.
+    fwrite(afl->fsrv.persistent_trace_bits, 1, afl->fsrv.real_map_size, cov_fd);
+    fclose(cov_fd);
+
+  }
+
+  #endif
 
   if (afl->pizza_is_served) {
 
@@ -3108,6 +3700,16 @@ stop_fuzzing:
        time_spent_working / afl->fsrv.total_execs);
   #endif
 
+  if (afl->afl_env.afl_final_sync) {
+
+    SAYF(cYEL "[!] " cRST
+              "\nPerforming final sync, this make take some time ...\n");
+    sync_fuzzers(afl);
+    write_bitmap(afl);
+    SAYF(cYEL "[!] " cRST "Done!\n\n");
+
+  }
+
   if (afl->is_main_node) {
 
     u8 path[PATH_MAX];
@@ -3119,6 +3721,80 @@ stop_fuzzing:
   if (frida_afl_preload) { ck_free(frida_afl_preload); }
 
   fclose(afl->fsrv.plot_file);
+
+  #ifdef INTROSPECTION
+  fclose(afl->fsrv.det_plot_file);
+  #endif
+
+  if (!afl->afl_env.afl_no_fastresume) {
+
+    /* create fastresume.bin */
+    u8 fr[PATH_MAX];
+    snprintf(fr, PATH_MAX, "%s/fastresume.bin", afl->out_dir);
+    ACTF("Writing %s ...", fr);
+  #ifdef HAVE_ZLIB
+    if ((fr_fd = ZLIBOPEN(fr, "wb9")) != NULL) {
+
+  #else
+    if ((fr_fd = open(fr, O_WRONLY | O_TRUNC | O_CREAT, DEFAULT_PERMISSION)) >=
+        0) {
+
+  #endif
+
+      u8   ver_string[8];
+      u32  w = 0;
+      u64 *ver = (u64 *)ver_string;
+      *ver = FAST_RESUME_VERSION + afl->shm.cmplog_mode +
+             (sizeof(struct queue_entry) << 1);
+
+      ZLIBWRITE(fr_fd, ver_string, sizeof(ver_string), "ver_string");
+      ZLIBWRITE(fr_fd, afl->virgin_bits, afl->fsrv.map_size, "virgin_bits");
+      ZLIBWRITE(fr_fd, afl->virgin_tmout, afl->fsrv.map_size, "virgin_tmout");
+      ZLIBWRITE(fr_fd, afl->virgin_crash, afl->fsrv.map_size, "virgin_crash");
+      ZLIBWRITE(fr_fd, afl->var_bytes, afl->fsrv.map_size, "var_bytes");
+      w += sizeof(ver_string) + afl->fsrv.map_size * 4;
+
+      u8                  on[1] = {1}, off[1] = {0};
+      u8                 *o_start = (u8 *)&(afl->queue_buf[0]->colorized);
+      u8                 *o_end = (u8 *)&(afl->queue_buf[0]->mother);
+      u32                 q_len = o_end - o_start;
+      u32                 m_len = ((afl->fsrv.map_size + 7) >> 3);
+      struct queue_entry *q;
+
+      afl->pending_not_fuzzed = afl->queued_items;
+      afl->active_items = afl->queued_items;
+
+      for (u32 i = 0; i < afl->queued_items; i++) {
+
+        q = afl->queue_buf[i];
+        ZLIBWRITE(fr_fd, (u8 *)&(q->colorized), q_len, "queue data");
+        if (!q->trace_mini) {
+
+          ZLIBWRITE(fr_fd, off, 1, "no_mini");
+          w += q_len + 1;
+
+        } else {
+
+          ZLIBWRITE(fr_fd, on, 1, "yes_mini");
+          ZLIBWRITE(fr_fd, q->trace_mini, m_len, "trace_mini");
+          w += q_len + m_len + 1;
+
+        }
+
+      }
+
+      ZLIBCLOSE(fr_fd);
+      afl->var_byte_count = count_bytes(afl, afl->var_bytes);
+      OKF("fastresume.bin successfully written with %u bytes.", w);
+
+    } else {
+
+      WARNF("Could not create fastresume.bin");
+
+    }
+
+  }
+
   destroy_queue(afl);
   destroy_extras(afl);
   destroy_custom_mutators(afl);
@@ -3133,12 +3809,25 @@ stop_fuzzing:
 
   afl_fsrv_deinit(&afl->fsrv);
 
+  for (u8 i = 0; i < afl->san_binary_length; i++) {
+
+    ck_free(afl->san_fsrvs[i].trace_bits);
+    afl_fsrv_deinit(&afl->san_fsrvs[i]);
+
+  }
+
+  if (afl->cmplog_binary) { afl_fsrv_deinit(&afl->cmplog_fsrv); }
+
   /* remove tmpfile */
-  if (afl->tmp_dir != NULL && !afl->in_place_resume && afl->fsrv.out_file) {
+  if (!afl->in_place_resume && afl->fsrv.out_file) {
 
     (void)unlink(afl->fsrv.out_file);
 
   }
+
+  ck_free(afl->n_fuzz);
+  ck_free(afl->n_fuzz_dup);
+  ck_free(afl->simplified_n_fuzz);
 
   if (afl->orig_cmdline) { ck_free(afl->orig_cmdline); }
   ck_free(afl->fsrv.target_path);

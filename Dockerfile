@@ -6,7 +6,7 @@
 #
 
 FROM ubuntu:22.04 AS aflplusplus
-LABEL "maintainer"="afl++ team <afl@aflplus.plus>"
+LABEL "maintainer"="AFL++ team <afl@aflplus.plus>"
 LABEL "about"="AFLplusplus container image"
 
 ### Comment out to enable these features
@@ -16,8 +16,8 @@ ENV NO_CORESIGHT=1
 ENV NO_NYX=1
 
 ### Only change these if you know what you are doing:
-# LLVM 15 does not look good so we stay at 14 to still have LTO
-ENV LLVM_VERSION=14
+# Current recommended LLVM version is 16
+ENV LLVM_VERSION=16
 # GCC 12 is producing compile errors for some targets so we stay at GCC 11
 ENV GCC_VERSION=11
 
@@ -42,12 +42,12 @@ RUN apt-get update && \
     python3 python3-dev python3-pip python-is-python3 \
     libtool libtool-bin libglib2.0-dev \
     apt-transport-https gnupg dialog \
-    gnuplot-nox libpixman-1-dev \
+    gnuplot-nox libpixman-1-dev bc \
     gcc-${GCC_VERSION} g++-${GCC_VERSION} gcc-${GCC_VERSION}-plugin-dev gdb lcov \
     clang-${LLVM_VERSION} clang-tools-${LLVM_VERSION} libc++1-${LLVM_VERSION} \
     libc++-${LLVM_VERSION}-dev libc++abi1-${LLVM_VERSION} libc++abi-${LLVM_VERSION}-dev \
     libclang1-${LLVM_VERSION} libclang-${LLVM_VERSION}-dev \
-    libclang-common-${LLVM_VERSION}-dev libclang-cpp${LLVM_VERSION} \
+    libclang-common-${LLVM_VERSION}-dev libclang-rt-${LLVM_VERSION}-dev libclang-cpp${LLVM_VERSION} \
     libclang-cpp${LLVM_VERSION}-dev liblld-${LLVM_VERSION} \
     liblld-${LLVM_VERSION}-dev liblldb-${LLVM_VERSION} liblldb-${LLVM_VERSION}-dev \
     libllvm${LLVM_VERSION} libomp-${LLVM_VERSION}-dev libomp5-${LLVM_VERSION} \
@@ -61,11 +61,14 @@ RUN apt-get update && \
 
 RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VERSION} 0 && \
     update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${GCC_VERSION} 0 && \
+    update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-${GCC_VERSION} 0 && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${LLVM_VERSION} 0 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${LLVM_VERSION} 0
 
 RUN wget -qO- https://sh.rustup.rs | CARGO_HOME=/etc/cargo sh -s -- -y -q --no-modify-path
 ENV PATH=$PATH:/etc/cargo/bin
+
+RUN apt clean -y
 
 ENV LLVM_CONFIG=llvm-config-${LLVM_VERSION}
 ENV AFL_SKIP_CPUFREQ=1
@@ -86,10 +89,10 @@ ARG TEST_BUILD
 
 RUN sed -i.bak 's/^	-/	/g' GNUmakefile && \
     make clean && make distrib && \
-    ([ "${TEST_BUILD}" ] || (make install && make clean)) && \
+    ([ "${TEST_BUILD}" ] || (make install)) && \
     mv GNUmakefile.bak GNUmakefile
 
 RUN echo "set encoding=utf-8" > /root/.vimrc && \
     echo ". /etc/bash_completion" >> ~/.bashrc && \
     echo 'alias joe="joe --wordwrap --joe_state -nobackup"' >> ~/.bashrc && \
-    echo "export PS1='"'[afl++ \h] \w$(__git_ps1) \$ '"'" >> ~/.bashrc
+    echo "export PS1='"'[AFL++ \h] \w \$ '"'" >> ~/.bashrc

@@ -5,11 +5,11 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@
 #endif
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <math.h>
 #include <sys/mman.h>
 
@@ -58,6 +59,115 @@ u8  last_intr = 0;
   #define AFL_PATH "/usr/local/lib/afl/"
 #endif
 
+void *afl_memmem(const void *haystack, size_t haystacklen, const void *needle,
+                 size_t needlelen) {
+
+  if (unlikely(needlelen > haystacklen)) { return NULL; }
+
+  for (u32 i = 0; i <= haystacklen - needlelen; ++i) {
+
+    if (unlikely(memcmp(haystack + i, needle, needlelen) == 0)) {
+
+      return (void *)(haystack + i);
+
+    }
+
+  }
+
+  return (void *)NULL;
+
+}
+
+void set_sanitizer_defaults() {
+
+  /* Set sane defaults for ASAN if nothing else is specified. */
+  u8 *have_asan_options = getenv("ASAN_OPTIONS");
+  u8 *have_ubsan_options = getenv("UBSAN_OPTIONS");
+  u8 *have_msan_options = getenv("MSAN_OPTIONS");
+  u8 *have_lsan_options = getenv("LSAN_OPTIONS");
+  u8  have_san_options = 0;
+  u8  default_options[1024] =
+      "detect_odr_violation=0:abort_on_error=1:symbolize=0:"
+      "allocator_may_return_null=1:handle_segv=0:handle_sigbus=0:"
+      "handle_abort=0:handle_sigfpe=0:handle_sigill=0:"
+      "detect_stack_use_after_return=0:check_initialization_order=0:";
+
+  if (have_asan_options || have_ubsan_options || have_msan_options ||
+      have_lsan_options) {
+
+    have_san_options = 1;
+
+  }
+
+  /* LSAN does not support abort_on_error=1. (is this still true??) */
+  u8 should_detect_leaks = 0;
+
+  if (!have_lsan_options) {
+
+    u8 buf[2048] = "";
+    if (!have_san_options) { strcpy(buf, default_options); }
+    if (have_asan_options) {
+
+      if (NULL != strstr(have_asan_options, "detect_leaks=0") ||
+          NULL != strstr(have_asan_options, "detect_leaks=false")) {
+
+        strcat(buf, "exitcode=" STRINGIFY(LSAN_ERROR) ":fast_unwind_on_malloc=0:print_suppressions=0:detect_leaks=0:malloc_context_size=0:");
+
+      } else {
+
+        should_detect_leaks = 1;
+        strcat(buf, "exitcode=" STRINGIFY(LSAN_ERROR) ":fast_unwind_on_malloc=0:print_suppressions=0:detect_leaks=1:malloc_context_size=30:");
+
+      }
+
+    }
+
+    setenv("LSAN_OPTIONS", buf, 1);
+
+  }
+
+  /* for everything not LSAN we disable detect_leaks */
+
+  if (!have_lsan_options) {
+
+    if (should_detect_leaks) {
+
+      strcat(default_options, "detect_leaks=1:malloc_context_size=30:");
+
+    } else {
+
+      strcat(default_options, "detect_leaks=0:malloc_context_size=0:");
+
+    }
+
+  }
+
+  /* Set sane defaults for ASAN if nothing else is specified. */
+
+  if (!have_san_options) { setenv("ASAN_OPTIONS", default_options, 1); }
+
+  /* Set sane defaults for UBSAN if nothing else is specified. */
+
+  if (!have_san_options) { setenv("UBSAN_OPTIONS", default_options, 1); }
+
+  /* MSAN is tricky, because it doesn't support abort_on_error=1 at this
+     point. So, we do this in a very hacky way. */
+
+  if (!have_msan_options) {
+
+    u8 buf[2048] = "";
+    if (!have_san_options) { strcpy(buf, default_options); }
+    strcat(buf, "exit_code=" STRINGIFY(MSAN_ERROR) ":msan_track_origins=0:");
+    setenv("MSAN_OPTIONS", buf, 1);
+
+  }
+
+  /* Envs for QASan */
+  setenv("QASAN_MAX_CALL_STACK", "0", 0);
+  setenv("QASAN_SYMBOLIZE", "0", 0);
+
+}
+
 u32 check_binary_signatures(u8 *fn) {
 
   int ret = 0, fd = open(fn, O_RDONLY);
@@ -69,7 +179,7 @@ u32 check_binary_signatures(u8 *fn) {
   if (f_data == MAP_FAILED) { PFATAL("Unable to mmap file '%s'", fn); }
   close(fd);
 
-  if (memmem(f_data, f_len, PERSIST_SIG, strlen(PERSIST_SIG) + 1)) {
+  if (afl_memmem(f_data, f_len, PERSIST_SIG, strlen(PERSIST_SIG) + 1)) {
 
     if (!be_quiet) { OKF(cPIN "Persistent mode binary detected."); }
     setenv(PERSIST_ENV_VAR, "1", 1);
@@ -94,7 +204,7 @@ u32 check_binary_signatures(u8 *fn) {
 
   }
 
-  if (memmem(f_data, f_len, DEFER_SIG, strlen(DEFER_SIG) + 1)) {
+  if (afl_memmem(f_data, f_len, DEFER_SIG, strlen(DEFER_SIG) + 1)) {
 
     if (!be_quiet) { OKF(cPIN "Deferred forkserver binary detected."); }
     setenv(DEFER_ENV_VAR, "1", 1);
@@ -319,7 +429,7 @@ u8 *find_binary(u8 *fname) {
 
           FATAL(
               "Unexpected overflow when processing ENV. This should never "
-              "happend.");
+              "had happened.");
 
         }
 
@@ -865,12 +975,12 @@ void read_bitmap(u8 *fname, u8 *map, size_t len) {
 
 /* Get unix time in milliseconds */
 
-u64 get_cur_time(void) {
+inline u64 get_cur_time(void) {
 
-  struct timeval  tv;
-  struct timezone tz;
+  struct timeval tv;
 
-  gettimeofday(&tv, &tz);
+  // TO NOT REPLACE WITH clock_gettime!!!
+  gettimeofday(&tv, NULL);
 
   return (tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000);
 
@@ -878,12 +988,12 @@ u64 get_cur_time(void) {
 
 /* Get unix time in microseconds */
 
-u64 get_cur_time_us(void) {
+inline u64 get_cur_time_us(void) {
 
-  struct timeval  tv;
-  struct timezone tz;
+  struct timeval tv;
 
-  gettimeofday(&tv, &tz);
+  // TO NOT REPLACE WITH clock_gettime!!!
+  gettimeofday(&tv, NULL);
 
   return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
 
@@ -894,7 +1004,7 @@ u64 get_cur_time_us(void) {
    Will return buf for convenience. */
 
 u8 *stringify_int(u8 *buf, size_t len, u64 val) {
-\
+
 #define CHK_FORMAT(_divisor, _limit_mult, _fmt, _cast)     \
   do {                                                     \
                                                            \
@@ -1058,7 +1168,7 @@ u8 *stringify_time_diff(u8 *buf, size_t len, u64 cur_ms, u64 event_ms) {
    Will return buf for convenience. */
 
 u8 *u_stringify_int(u8 *buf, u64 val) {
-\
+
 #define CHK_FORMAT(_divisor, _limit_mult, _fmt, _cast) \
   do {                                                 \
                                                        \
@@ -1214,6 +1324,35 @@ u8 *u_stringify_time_diff(u8 *buf, u64 cur_ms, u64 event_ms) {
 
 }
 
+/* Unsafe describe time delta as simple string.
+   Returns a pointer to buf for convenience. */
+
+u8 *u_simplestring_time_diff(u8 *buf, u64 cur_ms, u64 event_ms) {
+
+  if (!event_ms) {
+
+    sprintf(buf, "00:00:00");
+
+  } else {
+
+    u64 delta;
+    s32 t_d, t_h, t_m, t_s;
+
+    delta = cur_ms - event_ms;
+
+    t_d = delta / 1000 / 60 / 60 / 24;
+    t_h = (delta / 1000 / 60 / 60) % 24;
+    t_m = (delta / 1000 / 60) % 60;
+    t_s = (delta / 1000) % 60;
+
+    sprintf(buf, "%d:%02d:%02d:%02d", t_d, t_h, t_m, t_s);
+
+  }
+
+  return buf;
+
+}
+
 /* Reads the map size from ENV */
 u32 get_map_size(void) {
 
@@ -1274,4 +1413,53 @@ s32 create_file(u8 *fn) {
   return fd;
 
 }
+
+#ifdef __linux__
+
+/* Nyx requires a tmp workdir to access specific files (such as mmapped files,
+ * etc.). This helper function basically creates both a path to a tmp workdir
+ * and the workdir itself. If the environment variable TMPDIR is set, we use
+ * that as the base directory, otherwise we use /tmp. */
+char *create_nyx_tmp_workdir(void) {
+
+  char *tmpdir = getenv("TMPDIR");
+
+  if (!tmpdir) { tmpdir = "/tmp"; }
+
+  char *nyx_out_dir_path =
+      alloc_printf("%s/.nyx_tmp_%d/", tmpdir, (u32)getpid());
+
+  if (mkdir(nyx_out_dir_path, 0700)) { PFATAL("Unable to create nyx workdir"); }
+
+  return nyx_out_dir_path;
+
+}
+
+/* Vice versa, we remove the tmp workdir for nyx with this helper function. */
+void remove_nyx_tmp_workdir(afl_forkserver_t *fsrv, char *nyx_out_dir_path) {
+
+  char *workdir_path = alloc_printf("%s/workdir", nyx_out_dir_path);
+
+  if (access(workdir_path, R_OK) == 0) {
+
+    if (fsrv->nyx_handlers->nyx_remove_work_dir(workdir_path) != true) {
+
+      WARNF("Unable to remove nyx workdir (%s)", workdir_path);
+
+    }
+
+  }
+
+  if (rmdir(nyx_out_dir_path)) {
+
+    WARNF("Unable to remove nyx workdir (%s)", nyx_out_dir_path);
+
+  }
+
+  ck_free(workdir_path);
+  ck_free(nyx_out_dir_path);
+
+}
+
+#endif
 

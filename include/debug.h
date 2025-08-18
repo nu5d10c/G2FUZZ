@@ -5,12 +5,12 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>,
                      Andrea Fioraldi <andreafioraldi@gmail.com>,
                      Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -116,7 +116,7 @@
  * Box drawing sequences *
  *************************/
 
-#ifdef FANCY_BOXES
+#ifdef FANCY_BOXES_NO_UTF
 
   #define SET_G1 "\x1b)0"                      /* Set G1 for box drawing    */
   #define RESET_G1 "\x1b)B"                    /* Reset G1 to ASCII         */
@@ -136,22 +136,43 @@
 
 #else
 
-  #define SET_G1 ""
-  #define RESET_G1 ""
-  #define bSTART ""
-  #define bSTOP ""
-  #define bH "-"
-  #define bV "|"
-  #define bLT "+"
-  #define bRT "+"
-  #define bLB "+"
-  #define bRB "+"
-  #define bX "+"
-  #define bVR "+"
-  #define bVL "+"
-  #define bHT "+"
-  #define bHB "+"
+  #ifdef FANCY_BOXES
 
+    #define SET_G1 ""
+    #define RESET_G1 ""
+    #define bSTART ""
+    #define bSTOP ""
+    #define bH "\u2500"                        /* Horizontal line           */
+    #define bV "\u2502"                        /* Vertical line             */
+    #define bLT "\u250c"                       /* Left top corner           */
+    #define bRT "\u2510"                       /* Right top corner          */
+    #define bLB "\u2514"                       /* Left bottom corner        */
+    #define bRB "\u2518"                       /* Right bottom corner       */
+    #define bX "\u253c"                        /* Cross                     */
+    #define bVR "\u251c"                       /* Vertical, branch right    */
+    #define bVL "\u2524"                       /* Vertical, branch left     */
+    #define bHT "\u2534"                       /* Horizontal, branch top    */
+    #define bHB "\u252c"                       /* Horizontal, branch bottom */
+
+  #else
+
+    #define SET_G1 ""
+    #define RESET_G1 ""
+    #define bSTART ""
+    #define bSTOP ""
+    #define bH "-"
+    #define bV "|"
+    #define bLT "+"
+    #define bRT "+"
+    #define bLB "+"
+    #define bRB "+"
+    #define bX "+"
+    #define bVR "+"
+    #define bVL "+"
+    #define bHT "+"
+    #define bHB "+"
+
+  #endif
 #endif                                                      /* ^FANCY_BOXES */
 
 /***********************
@@ -293,8 +314,8 @@ static inline const char *colorfilter(const char *x) {
 #define FATAL(x...)                                                      \
   do {                                                                   \
                                                                          \
-    SAYF(bSTOP RESET_G1 CURSOR_SHOW cRST cLRD                            \
-         "\n[-] PROGRAM ABORT : " cRST   x);                               \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                         \
+         "\n[-] PROGRAM ABORT : " cRST x);                               \
     SAYF(cLRD "\n         Location : " cRST "%s(), %s:%u\n\n", __func__, \
          __FILE__, (u32)__LINE__);                                       \
     exit(1);                                                             \
@@ -306,10 +327,11 @@ static inline const char *colorfilter(const char *x) {
 #define ABORT(x...)                                                      \
   do {                                                                   \
                                                                          \
-    SAYF(bSTOP RESET_G1 CURSOR_SHOW cRST cLRD                            \
-         "\n[-] PROGRAM ABORT : " cRST   x);                               \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                         \
+         "\n[-] PROGRAM ABORT : " cRST x);                               \
     SAYF(cLRD "\n    Stop location : " cRST "%s(), %s:%u\n\n", __func__, \
          __FILE__, (u32)__LINE__);                                       \
+    fflush(stdout);                                                      \
     abort();                                                             \
                                                                          \
   } while (0)
@@ -320,8 +342,8 @@ static inline const char *colorfilter(const char *x) {
   do {                                                                 \
                                                                        \
     fflush(stdout);                                                    \
-    SAYF(bSTOP RESET_G1 CURSOR_SHOW cRST cLRD                          \
-         "\n[-]  SYSTEM ERROR : " cRST   x);                             \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                       \
+         "\n[-]  SYSTEM ERROR : " cRST x);                             \
     SAYF(cLRD "\n    Stop location : " cRST "%s(), %s:%u\n", __func__, \
          __FILE__, (u32)__LINE__);                                     \
     SAYF(cLRD "       OS message : " cRST "%s\n", strerror(errno));    \

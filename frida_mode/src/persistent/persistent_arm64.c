@@ -16,7 +16,7 @@ typedef struct {
 } persistent_ctx_t;
 
 static persistent_ctx_t saved_regs = {0};
-static gpointer         saved_lr = NULL;
+static gpointer         persistent_loop = NULL;
 
 gboolean persistent_is_supported(void) {
 
@@ -216,17 +216,10 @@ static void instrument_persitent_restore_regs(GumArm64Writer   *cw,
 
 }
 
-static void instrument_exit(GumArm64Writer *cw) {
+static void instrument_afl_persistent_loop_func(void) {
 
-  gum_arm64_writer_put_mov_reg_reg(cw, ARM64_REG_X0, ARM64_REG_XZR);
-  gum_arm64_writer_put_call_address_with_arguments(
-      cw, GUM_ADDRESS(_exit), 1, GUM_ARG_REGISTER, ARM64_REG_X0);
+  if (__afl_persistent_loop(persistent_count) == 0) { _exit(0); }
 
-}
-
-static int instrument_afl_persistent_loop_func(void) {
-
-  int ret = __afl_persistent_loop(persistent_count);
   if (instrument_previous_pc_addr == NULL) {
 
     FATAL("instrument_previous_pc_addr uninitialized");
@@ -234,7 +227,6 @@ static int instrument_afl_persistent_loop_func(void) {
   }
 
   *instrument_previous_pc_addr = instrument_hash_zero;
-  return ret;
 
 }
 
@@ -284,7 +276,7 @@ static void instrument_persitent_save_lr(GumArm64Writer *cw) {
       GUM_INDEX_PRE_ADJUST);
 
   gum_arm64_writer_put_ldr_reg_address(cw, ARM64_REG_X0,
-                                       GUM_ADDRESS(&saved_lr));
+                                       GUM_ADDRESS(&persistent_ret));
 
   gum_arm64_writer_put_str_reg_reg_offset(cw, ARM64_REG_LR, ARM64_REG_X0, 0);
 
@@ -297,65 +289,68 @@ static void instrument_persitent_save_lr(GumArm64Writer *cw) {
 void persistent_prologue_arch(GumStalkerOutput *output) {
 
   /*
+   *  SAVE RET (Used to write the epilogue if persistent_ret is not set)
    *  SAVE REGS
-   *  SAVE RET
-   *  POP RET
-   * loop:
+   * loop: (Save address of where the eiplogue should jump back to)
    *  CALL instrument_afl_persistent_loop
-   *  TEST EAX, EAX
-   *  JZ end:
-   *  call hook (optionally)
+   *  CALL hook (optionally)
    *  RESTORE REGS
-   *  call original
-   *  jmp loop:
-   *
-   * end:
-   *  JMP SAVED RET
-   *
-   * original:
+   *  CALL INSTRUMENTED PERSISTENT FUNC
+   *  JMP loop
    *  INSTRUMENTED PERSISTENT FUNC
    */
 
   GumArm64Writer *cw = output->writer.arm64;
 
-  gconstpointer loop = cw->code + 1;
-
   FVERBOSE("Persistent loop reached");
 
+  /* This is the location our epilogue should be written below */
+  if (persistent_ret == 0) { instrument_persitent_save_lr(cw); }
+
+  /* Save the current context */
   instrument_persitent_save_regs(cw, &saved_regs);
 
-  /* loop: */
+  /*
+   * Store a pointer to where we should return for our next iteration.
+   * This is the location our epilogue should branch to
+   */
+  persistent_loop = gum_arm64_writer_cur(cw);
+
+  gconstpointer loop = cw->code + 1;
   gum_arm64_writer_put_label(cw, loop);
 
-  /* call instrument_prologue_func */
+  /*
+   * call __afl_persistent_loop which will _exit if we have reached our
+   * loop count. Also reset our previous_pc
+   */
   instrument_afl_persistent_loop(cw);
-
-  /* jz done */
-  gconstpointer done = cw->code + 1;
-  gum_arm64_writer_put_cmp_reg_reg(cw, ARM64_REG_X0, ARM64_REG_XZR);
-  gum_arm64_writer_put_b_cond_label(cw, ARM64_CC_EQ, done);
 
   /* Optionally call the persistent hook */
   persistent_prologue_hook(cw, &saved_regs);
 
+  /* Restore our CPU context before we continue execution */
   instrument_persitent_restore_regs(cw, &saved_regs);
-  gconstpointer original = cw->code + 1;
-  /* call original */
 
+  gconstpointer original = cw->code + 1;
+
+  /*
+   * Call our original code, that way we regain control if our target
+   * function returns without reaching the epilogue as an additional
+   * safety net
+   */
   gum_arm64_writer_put_bl_label(cw, original);
 
-  /* jmp loop */
+  /*
+   * Return for our next iteration if our original function returns
+   * and control hasn't reached the epilogue for some reason
+   */
   gum_arm64_writer_put_b_label(cw, loop);
 
-  /* done: */
-  gum_arm64_writer_put_label(cw, done);
-
-  instrument_exit(cw);
-
-  /* original: */
+  /*
+   * The original code for our target function will be emitted
+   * immediately following this
+   */
   gum_arm64_writer_put_label(cw, original);
-
-  instrument_persitent_save_lr(cw);
 
   if (persistent_debug) { gum_arm64_writer_put_brk_imm(cw, 0); }
 
@@ -368,7 +363,7 @@ void persistent_epilogue_arch(GumStalkerOutput *output) {
   if (persistent_debug) { gum_arm64_writer_put_brk_imm(cw, 0); }
 
   gum_arm64_writer_put_ldr_reg_address(cw, ARM64_REG_X0,
-                                       GUM_ADDRESS(&saved_lr));
+                                       GUM_ADDRESS(&persistent_loop));
 
   gum_arm64_writer_put_ldr_reg_reg_offset(cw, ARM64_REG_X0, ARM64_REG_X0, 0);
 

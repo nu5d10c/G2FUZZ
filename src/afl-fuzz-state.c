@@ -5,11 +5,11 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -24,12 +24,9 @@
  */
 
 #include <signal.h>
+#include <limits.h>
 #include "afl-fuzz.h"
 #include "envs.h"
-
-s8  interesting_8[] = {INTERESTING_8};
-s16 interesting_16[] = {INTERESTING_8, INTERESTING_16};
-s32 interesting_32[] = {INTERESTING_8, INTERESTING_16, INTERESTING_32};
 
 char *power_names[POWER_SCHEDULES_NUM] = {"explore", "mmopt", "exploit",
                                           "fast",    "coe",   "lin",
@@ -88,9 +85,8 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->w_end = 0.3;
   afl->g_max = 5000;
   afl->period_pilot_tmp = 5000.0;
-  afl->schedule = FAST;                 /* Power schedule (default: FAST)   */
+  afl->schedule = EXPLORE;              /* Power schedule (default: EXPLORE)*/
   afl->havoc_max_mult = HAVOC_MAX_MULT;
-
   afl->clear_screen = 1;                /* Window resized?                  */
   afl->havoc_div = 1;                   /* Cycle count divisor for havoc    */
   afl->stage_name = "init";             /* Name of the current fuzz stage   */
@@ -100,17 +96,17 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->hang_tmout = EXEC_TIMEOUT;
   afl->exit_on_time = 0;
   afl->stats_update_freq = 1;
+  afl->stats_file_update_freq_msecs = STATS_UPDATE_SEC * 1000;
   afl->stats_avg_exec = 0;
-  afl->skip_deterministic = 1;
+  afl->skip_deterministic = 0;
   afl->sync_time = SYNC_TIME;
   afl->cmplog_lvl = 2;
   afl->min_length = 1;
   afl->max_length = MAX_FILE;
-#ifndef NO_SPLICING
-  afl->use_splicing = 1;
-#endif
+  afl->switch_fuzz_mode = STRATEGY_SWITCH_TIME * 1000;
   afl->q_testcase_max_cache_size = TESTCASE_CACHE_SIZE * 1048576UL;
   afl->q_testcase_max_cache_entries = 64 * 1024;
+  afl->last_scored_idx = -1;
 
 #ifdef HAVE_AFFINITY
   afl->cpu_aff = -1;                    /* Selected CPU core                */
@@ -137,6 +133,14 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->fsrv.dev_null_fd = -1;
   afl->fsrv.child_pid = -1;
   afl->fsrv.out_dir_fd = -1;
+
+  /* Init SkipDet */
+  afl->skipdet_g =
+      (struct skipdet_global *)ck_alloc(sizeof(struct skipdet_global));
+  afl->skipdet_g->inf_prof =
+      (struct inf_profile *)ck_alloc(sizeof(struct inf_profile));
+  afl->havoc_prof =
+      (struct havoc_profile *)ck_alloc(sizeof(struct havoc_profile));
 
   init_mopt_globals(afl);
 
@@ -197,11 +201,25 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_exit_on_time =
                 (u8 *)get_afl_env(afl_environment_variables[i]);
 
+          } else if (!strncmp(env, "AFL_CRASHING_SEEDS_AS_NEW_CRASH",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_crashing_seeds_as_new_crash =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
           } else if (!strncmp(env, "AFL_NO_AFFINITY",
 
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_no_affinity =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_NO_WARN_INSTABILITY",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_warn_instability =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_TRY_AFFINITY",
@@ -252,6 +270,27 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_import_first =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
+          } else if (!strncmp(env, "AFL_FINAL_SYNC",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_final_sync =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_NO_SYNC",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_sync =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_NO_FASTRESUME",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_fastresume =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
           } else if (!strncmp(env, "AFL_CUSTOM_MUTATOR_ONLY",
 
                               afl_environment_variable_len)) {
@@ -259,11 +298,28 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_custom_mutator_only =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
+          } else if (!strncmp(env, "AFL_CUSTOM_MUTATOR_LATE_SEND",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_custom_mutator_late_send =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
           } else if (!strncmp(env, "AFL_CMPLOG_ONLY_NEW",
 
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_cmplog_only_new =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_DISABLE_REDUNDANT",
+
+                              afl_environment_variable_len) ||
+                     !strncmp(env, "AFL_NO_REDUNDANT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_disable_redundant =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_NO_STARTUP_CALIBRATION",
@@ -290,6 +346,20 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_ignore_problems =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_IGNORE_SEED_PROBLEMS",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_ignore_seed_problems =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_IGNORE_TIMEOUTS",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_ignore_timeouts =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES",
@@ -376,6 +446,13 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_statsd =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_POST_PROCESS_KEEP_ORIGINAL",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_post_process_keep_original =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_TMPDIR",
@@ -551,6 +628,33 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
 
             }
 
+          } else if (!strncmp(env, "AFL_FUZZER_STATS_UPDATE_INTERVAL",
+
+                              afl_environment_variable_len)) {
+
+            u64 stats_update_freq_sec =
+                strtoull(get_afl_env(afl_environment_variables[i]), NULL, 0);
+            if (stats_update_freq_sec >= UINT_MAX ||
+                0 == stats_update_freq_sec) {
+
+              WARNF(
+                  "Incorrect value given to AFL_FUZZER_STATS_UPDATE_INTERVAL, "
+                  "using default of %d seconds\n",
+                  STATS_UPDATE_SEC);
+
+            } else {
+
+              afl->stats_file_update_freq_msecs = stats_update_freq_sec * 1000;
+
+            }
+
+          } else if (!strncmp(env, "AFL_SHA1_FILENAMES",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_sha1_filenames =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
           }
 
         } else {
@@ -612,7 +716,15 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
 
   }
 
-  if (afl->afl_env.afl_pizza_mode) { afl->pizza_is_served = 1; }
+  if (afl->afl_env.afl_pizza_mode > 0) {
+
+    afl->pizza_is_served = 1;
+
+  } else if (afl->afl_env.afl_pizza_mode < 0) {
+
+    OKF("Pizza easter egg mode is now disabled.");
+
+  }
 
   if (issue_detected) { sleep(2); }
 
@@ -627,6 +739,21 @@ void afl_state_deinit(afl_state_t *afl) {
   if (afl->pass_stats) { ck_free(afl->pass_stats); }
   if (afl->orig_cmp_map) { ck_free(afl->orig_cmp_map); }
   if (afl->cmplog_binary) { ck_free(afl->cmplog_binary); }
+  if (afl->cycle_schedules) {
+
+    for (u32 i = 0; i < afl->fsrv.map_size; i++) {
+
+      if (afl->top_rated_candidates[i]) {
+
+        ck_free(afl->top_rated_candidates[i]);
+
+      }
+
+    }
+
+    ck_free(afl->top_rated_candidates);
+
+  }
 
   afl_free(afl->queue_buf);
   afl_free(afl->out_buf);
@@ -635,6 +762,8 @@ void afl_state_deinit(afl_state_t *afl) {
   afl_free(afl->in_buf);
   afl_free(afl->in_scratch_buf);
   afl_free(afl->ex_buf);
+  afl_free(afl->alias_table);
+  afl_free(afl->alias_probability);
 
   ck_free(afl->virgin_bits);
   ck_free(afl->virgin_tmout);
@@ -646,6 +775,11 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->first_trace);
   ck_free(afl->map_tmp_buf);
 
+  ck_free(afl->skipdet_g->inf_prof);
+  ck_free(afl->skipdet_g->virgin_det_bits);
+  ck_free(afl->skipdet_g);
+  ck_free(afl->havoc_prof);
+
   list_remove(&afl_states, afl);
 
 }
@@ -653,7 +787,7 @@ void afl_state_deinit(afl_state_t *afl) {
 void afl_states_stop(void) {
 
   /* We may be inside a signal handler.
-   Set flags first, send kill signals to child proceses later. */
+   Set flags first, send kill signals to child processes later. */
   LIST_FOREACH(&afl_states, afl_state_t, {
 
     el->stop_soon = 1;
@@ -669,8 +803,9 @@ void afl_states_stop(void) {
     if (el->fsrv.fsrv_pid > 0) {
 
       kill(el->fsrv.fsrv_pid, el->fsrv.fsrv_kill_signal);
+      usleep(100);
       /* Make sure the forkserver does not end up as zombie. */
-      waitpid(el->fsrv.fsrv_pid, NULL, 0);
+      waitpid(el->fsrv.fsrv_pid, NULL, WNOHANG);
 
     }
 

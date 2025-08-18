@@ -5,7 +5,7 @@
    Written by Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2015, 2016 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -39,7 +39,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#if LLVM_VERSION_MAJOR < 17
+  #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#endif
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Pass.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -83,7 +85,7 @@ class CmplogSwitches : public ModulePass {
 #if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
 #else
-  bool        runOnModule(Module &M) override;
+  bool runOnModule(Module &M) override;
 
   #if LLVM_VERSION_MAJOR < 4
   const char *getPassName() const override {
@@ -116,12 +118,17 @@ llvmGetPassPluginInfo() {
   #if LLVM_VERSION_MAJOR <= 13
             using OptimizationLevel = typename PassBuilder::OptimizationLevel;
   #endif
-            PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel OL) {
+            PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM,
+                                                  OptimizationLevel  OL
+  #if LLVM_VERSION_MAJOR >= 20
+                                                  ,
+                                                  ThinOrFullLTOPhase Phase
+  #endif
+                                               ) {
 
-                  MPM.addPass(CmplogSwitches());
+              MPM.addPass(CmplogSwitches());
 
-                });
+            });
 
           }};
 
@@ -440,16 +447,16 @@ bool CmplogSwitches::runOnModule(Module &M) {
     printf("Running cmplog-switches-pass by andreafioraldi@gmail.com\n");
   else
     be_quiet = 1;
-  hookInstrs(M);
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
-  auto PA = PreservedAnalyses::all();
-#endif
+  bool ret = hookInstrs(M);
   verifyModule(M);
 
 #if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
-  return PA;
+  if (ret == false)
+    return PreservedAnalyses::all();
+  else
+    return PreservedAnalyses();
 #else
-  return true;
+  return ret;
 #endif
 
 }

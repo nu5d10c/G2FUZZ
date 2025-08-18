@@ -7,11 +7,11 @@ For the GCC-based instrumentation, see
 
 ## 1) Introduction
 
-! llvm_mode works with llvm versions 3.8 up to 13 !
+! llvm_mode works with llvm versions 3.8 up to 17 - but 13+ is recommended !
 
 The code in this directory allows you to instrument programs for AFL++ using
 true compiler-level instrumentation, instead of the more crude assembly-level
-rewriting approach taken by afl-gcc and afl-clang. This has several interesting
+rewriting approach taken by obsolete afl-gcc and afl-clang. This has several interesting
 properties:
 
 - The compiler can make many optimizations that are hard to pull off when
@@ -31,10 +31,6 @@ properties:
 - Because the feature relies on the internals of LLVM, it is clang-specific and
   will *not* work with GCC (see ../gcc_plugin/ for an alternative once it is
   available).
-
-Once this implementation is shown to be sufficiently robust and portable, it
-will probably replace afl-clang. For now, it can be built separately and
-co-exists with the original code.
 
 The idea and much of the initial implementation came from Laszlo Szekeres.
 
@@ -105,7 +101,7 @@ also use afl-cc/afl-c++ and instead direct it to use LLVM instrumentation by
 either setting `AFL_CC_COMPILER=LLVM` or pass the parameter `--afl-llvm` via
 CFLAGS/CXXFLAGS/CPPFLAGS.
 
-The tool honors roughly the same environmental variables as afl-gcc (see
+The tool supports a lot of environmental variables(see
 [docs/env_variables.md](../docs/env_variables.md)). This includes
 `AFL_USE_ASAN`, `AFL_HARDEN`, and `AFL_DONT_OPTIMIZE`. However, `AFL_INST_RATIO`
 is not honored as it does not serve a good purpose with the more effective
@@ -166,6 +162,10 @@ explanation, see [README.persistent_mode.md](README.persistent_mode.md).
 Just specify `AFL_LLVM_DICT2FILE=/absolute/path/file.txt` and during compilation
 all constant string compare parameters will be written to this file to be used
 with afl-fuzz' `-x` option.
+
+Adding `AFL_LLVM_DICT2FILE_NO_MAIN=1` will skip parsing `main()` which often
+does command line parsing which has string comparisons that are not helpful
+for fuzzing.
 
 ## 6) AFL++ Context Sensitive Branch Coverage
 
@@ -251,10 +251,6 @@ low cost (one instruction per edge).
 (The alternative of saturated counters has been tested also and proved to be
 inferior in terms of path discovery.)
 
-This is implemented in afl-gcc and afl-gcc-fast, however, for llvm_mode this is
-optional if multithread safe counters are selected or the llvm version is below
-9 - as there are severe performance costs in these cases.
-
 If you want to enable this for llvm versions below 9 or thread safe counters,
 then set
 
@@ -276,3 +272,27 @@ Please note that the default counter implementations are not thread safe!
 
 Support for thread safe counters in mode LLVM CLASSIC can be activated with
 setting `AFL_LLVM_THREADSAFE_INST=1`.
+
+## 8) Source code coverage through instrumentation
+
+Measuring source code coverage is a common task in fuzzing, but it is very
+difficut to do in some situations (e.g. when using snapshot fuzzing).
+
+When using the `AFL_LLVM_INSTRUMENT=llvm-codecov` option, afl-cc will use
+native trace-pc-guard instrumentation but additionally select options that
+are required to utilize the instrumentation for source code coverage.
+
+In particular, it will switch the instrumentation to be per basic block
+instead of instrumenting edges, disable all guard pruning and enable the
+experimental pc-table support that allows the runtime to gather 100% of
+instrumented basic blocks at start, including their locations.
+
+Note: You must compile AFL with the `CODE_COVERAGE=1` option to enable the
+respective parts in the AFL compiler runtime. Support is currently only
+implemented for Nyx, but can in theory also work without Nyx.
+
+Note: You might have to adjust `MAP_SIZE_POW2` in include/config.h to ensure
+that your coverage map is large enough to hold all basic blocks of your
+target program without any collisions.
+
+More documentation on how to utilize this with Nyx will follow.

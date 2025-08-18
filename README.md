@@ -6,14 +6,42 @@ This paper presents a novel approach to enabling grammar-aware fuzzing over non-
 
 
 # How to use it
-## The setting of LLM
-In default, we use the GPT-3.5 to get the generator. To use it, you’ll need to define your OpenAI API key in both `program_gen.py` and `generator_mutation_gpt_3_5.py`. If you wish to use other large language models (LLMs), you can modify the code in these two files accordingly.
-
-To run the fuzzer, use the following command:
+## lib
 ```
-    ./afl-fuzz -i input -o output -c PROGRAM_CMP -m 1024 -J PROGRAM_NAME -k G2FUZZ_LOC -- PROGRAM_AFL @@
+  pip install openai==1.63.2
 ```
-`-J`: Specifies the target program name.
-`-k`: Specifies the path to G2FUZZ.
 
-G2FUZZ will generate diverse input structures. These inputs help the fuzzer explore untested code regions more effectively.
+## prepare the setting files
+```
+    cd evaluation_path
+    cp path/to/G2FUZZ/openai_key.txt .
+    cp path/to/G2FUZZ/program_to_format.json .
+    cp path/to/G2FUZZ/model_setting.json .
+```
+
+## Step I: Run seed generation to get init output
+```
+python ./G2FUZZ/program_gen.py --output ./target_output --program <program_name>
+```
+
+For example:
+```
+python ./G2FUZZ/program_gen.py --output ./exiv2_output --program exiv2
+```
+
+## Step II: Run fuzzing
+1. Construct input corpus
+```
+mkdir initial_seeds
+cp -r seeds/* initial_seeds
+cp -r output/gen_seeds initial_seeds
+```
+
+2. Run:
+```
+./G2FUZZ/run.sh ./G2FUZZ/afl-fuzz ./initial_seeds ./target_output ./program.cmp program_name /path/to/G2FUZZ ./program.afl
+```
+Note that: `./target_output` is the `--output ./target_output` in `Step I`.
+
+For example:
+./G2FUZZ/run.sh ./G2FUZZ/afl-fuzz ./initial_seeds ./exiv2_output exiv2 /evaluation/G2FUZZ_test/ ./justafl/exiv2

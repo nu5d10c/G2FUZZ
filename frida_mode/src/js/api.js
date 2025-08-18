@@ -5,16 +5,16 @@ class Afl {
      * it takes as arguments a `NativePointer` and a `number`. It can be
      * called multiple times to exclude several ranges.
      */
-    static addExcludedRange(addressess, size) {
-        Afl.jsApiAddExcludeRange(addressess, size);
+    static addExcludedRange(addresses, size) {
+        Afl.jsApiAddExcludeRange(addresses, size);
     }
     /**
      * This is equivalent to setting a value in `AFL_FRIDA_INST_RANGES`,
      * it takes as arguments a `NativePointer` and a `number`. It can be
      * called multiple times to include several ranges.
      */
-    static addIncludedRange(addressess, size) {
-        Afl.jsApiAddIncludeRange(addressess, size);
+    static addIncludedRange(addresses, size) {
+        Afl.jsApiAddIncludeRange(addresses, size);
     }
     /**
      * This must always be called at the end of your script. This lets
@@ -52,7 +52,7 @@ class Afl {
     }
     /**
      * Print a message to the STDOUT. This should be preferred to
-     * FRIDA's `console.log` since FRIDA will queue it's log messages.
+     * FRIDA's `console.log` since FRIDA will queue its log messages.
      * If `console.log` is used in a callback in particular, then there
      * may no longer be a thread running to service this queue.
      */
@@ -151,6 +151,12 @@ class Afl {
         Afl.jsApiSetInstrumentLibraries();
     }
     /**
+     * See `AFL_FRIDA_INST_NO_DYNAMIC_LOAD`
+     */
+    static setInstrumentNoDynamicLoad() {
+      Afl.jsApiSetInstrumentNoDynamicLoad();
+    }
+    /**
      * See `AFL_FRIDA_INST_NO_OPTIMIZE`
      */
     static setInstrumentNoOptimize() {
@@ -169,6 +175,12 @@ class Afl {
      */
     static setInstrumentSeed(seed) {
         Afl.jsApiSetInstrumentSeed(seed);
+    }
+    /*
+     * See `AFL_FRIDA_INST_NO_SUPPRESS`
+     */
+    static setInstrumentSuppressDisable() {
+        Afl.jsApiSetInstrumentSuppressDisable();
     }
     /**
      * See `AFL_FRIDA_INST_TRACE_UNIQUE`.
@@ -193,14 +205,14 @@ class Afl {
     }
     /**
      * This is equivalent to setting `AFL_FRIDA_PERSISTENT_ADDR`, again a
-     * `NativePointer` should be provided as it's argument.
+     * `NativePointer` should be provided as its argument.
      */
     static setPersistentAddress(address) {
         Afl.jsApiSetPersistentAddress(address);
     }
     /**
      * This is equivalent to setting `AFL_FRIDA_PERSISTENT_CNT`, a
-     * `number` should be provided as it's argument.
+     * `number` should be provided as its argument.
      */
     static setPersistentCount(count) {
         Afl.jsApiSetPersistentCount(count);
@@ -220,7 +232,7 @@ class Afl {
     }
     /**
      * This is equivalent to setting `AFL_FRIDA_PERSISTENT_RET`, again a
-     * `NativePointer` should be provided as it's argument.
+     * `NativePointer` should be provided as its argument.
      */
     static setPersistentReturn(address) {
         Afl.jsApiSetPersistentReturn(address);
@@ -314,6 +326,12 @@ class Afl {
     static jsApiGetSymbol(name) {
         return Afl.module.getExportByName(name);
     }
+
+    static IJON = class {
+        static set(addr, val) {
+            Afl.jsApiIjonSet((addr ^ val) & 0xffffffff);
+        }
+    }
 }
 /**
  * Field containing the `Module` object for `afl-frida-trace.so` (the FRIDA mode
@@ -336,9 +354,11 @@ Afl.jsApiSetInstrumentDebugFile = Afl.jsApiGetFunction("js_api_set_instrument_de
 Afl.jsApiSetInstrumentInstructions = Afl.jsApiGetFunction("js_api_set_instrument_instructions", "void", []);
 Afl.jsApiSetInstrumentJit = Afl.jsApiGetFunction("js_api_set_instrument_jit", "void", []);
 Afl.jsApiSetInstrumentLibraries = Afl.jsApiGetFunction("js_api_set_instrument_libraries", "void", []);
+Afl.jsApiSetInstrumentNoDynamicLoad = Afl.jsApiGetFunction("js_api_set_instrument_no_dynamic_load", "void", []);
 Afl.jsApiSetInstrumentNoOptimize = Afl.jsApiGetFunction("js_api_set_instrument_no_optimize", "void", []);
 Afl.jsApiSetInstrumentRegsFile = Afl.jsApiGetFunction("js_api_set_instrument_regs_file", "void", ["pointer"]);
 Afl.jsApiSetInstrumentSeed = Afl.jsApiGetFunction("js_api_set_instrument_seed", "void", ["uint64"]);
+Afl.jsApiSetInstrumentSuppressDisable = Afl.jsApiGetFunction("js_api_set_instrument_suppress_disable", "void", []);
 Afl.jsApiSetInstrumentTrace = Afl.jsApiGetFunction("js_api_set_instrument_trace", "void", []);
 Afl.jsApiSetInstrumentTraceUnique = Afl.jsApiGetFunction("js_api_set_instrument_trace_unique", "void", []);
 Afl.jsApiSetInstrumentUnstableCoverageFile = Afl.jsApiGetFunction("js_api_set_instrument_unstable_coverage_file", "void", ["pointer"]);
@@ -363,3 +383,4 @@ Afl.jsApiSetVerbose = Afl.jsApiGetFunction("js_api_set_verbose", "void", []);
 Afl.jsApiWrite = new NativeFunction(
 /* tslint:disable-next-line:no-null-keyword */
 Module.getExportByName(null, "write"), "int", ["int", "pointer", "int"]);
+Afl.jsApiIjonSet = Afl.jsApiGetFunction("js_api_ijon_set", "void", ["uint32"]);

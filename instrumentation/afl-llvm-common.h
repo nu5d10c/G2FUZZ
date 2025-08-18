@@ -8,6 +8,13 @@
 #include <list>
 #include <string>
 #include <fstream>
+
+#ifdef __has_include
+  #if __has_include(<optional>)
+    #include <optional>
+  #endif
+#endif
+
 #include <sys/time.h>
 
 #include "llvm/Config/llvm-config.h"
@@ -21,7 +28,9 @@ typedef long double max_align_t;
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#if LLVM_VERSION_MAJOR < 17
+  #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#endif
 
 #if LLVM_VERSION_MAJOR > 3 || \
     (LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR > 4)
@@ -35,6 +44,12 @@ typedef long double max_align_t;
 #if LLVM_VERSION_MAJOR >= 11
   #define MNAME M.getSourceFileName()
   #define FMNAME F.getParent()->getSourceFileName()
+  #if LLVM_VERSION_MAJOR >= 16
+// None becomes deprecated
+// the standard std::nullopt_t is recommended instead
+// from C++17 and onwards.
+constexpr std::nullopt_t None = std::nullopt;
+  #endif
 #else
   #define MNAME std::string("")
   #define FMNAME std::string("")
@@ -46,6 +61,7 @@ void  initInstrumentList();
 bool  isInInstrumentList(llvm::Function *F, std::string Filename);
 unsigned long long int calculateCollisions(uint32_t edges);
 void                   scanForDangerousFunctions(llvm::Module *M);
+unsigned int           calcCyclomaticComplexity(llvm::Function *F);
 
 #ifndef IS_EXTERN
   #define IS_EXTERN

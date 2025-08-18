@@ -114,17 +114,18 @@ def main():
     # ---------------------------------------------------
     # Load the binary to emulate and map it into memory
 
+    # Load the binary to emulate
     print("Loading data input from {}".format(args.input_file))
     binary_file = open(BINARY_FILE, "rb")
     binary_code = binary_file.read()
     binary_file.close()
 
-    # Apply constraints to the mutated input
+    # Assert that the binary size is within limits
     if len(binary_code) > CODE_SIZE_MAX:
         print("Binary code is too large (> {} bytes)".format(CODE_SIZE_MAX))
         return
 
-    # Write the mutated command into the data buffer
+    # Map the binary into memory
     uc.mem_map(CODE_ADDRESS, CODE_SIZE_MAX)
     uc.mem_write(CODE_ADDRESS, binary_code)
 

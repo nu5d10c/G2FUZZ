@@ -15,6 +15,7 @@ Underneath it is built upon KVM and QEMU and requires a modern Linux kernel
 requires an Intel processor (6th generation onwards) and a special 5.10 kernel
 (see [KVM-Nyx](https://github.com/nyx-fuzz/KVM-Nyx)).
 
+
 ## Building Nyx mode
 
 1. Install all the packages from [docs/INSTALL.md](../docs/INSTALL.md).
@@ -22,7 +23,7 @@ requires an Intel processor (6th generation onwards) and a special 5.10 kernel
 2. Additionally, install the following packages:
 
    ```shell
-   apt-get install -y libgtk-3-dev pax-utils python3-msgpack python3-jinja2
+   apt-get install -y libgtk-3-dev pax-utils python3-msgpack python3-jinja2 libcapstone-dev
    ```
 
 3. As Nyx is written in Rust, install the newest rust compiler (rust packages in
@@ -32,7 +33,7 @@ requires an Intel processor (6th generation onwards) and a special 5.10 kernel
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-4. Finally build Nyx mode:
+4. Finally build Nyx mode (or use `make distrib` at the repo root to build all AFL++ modes):
 
    ```shell
    ./build_nyx_support.sh
@@ -40,6 +41,7 @@ requires an Intel processor (6th generation onwards) and a special 5.10 kernel
 
 5. Optionally, for binary-only fuzzing: set up the required 5.10 kernel, see
    [KVM-Nyx](https://github.com/nyx-fuzz/KVM-Nyx).
+
 
 ## Preparing to fuzz a target with Nyx mode
 
@@ -68,13 +70,30 @@ This will create a directory with all necessary files and the Nyx configuration.
 The name of the directory will be whatever you choose for `PACKAGE-DIRECTORY`
 above.
 
-In the final step for the packaging we generate the Nyx configuration:
+Note that if the target reads from a file then use the `-file /path/to/file`
+parameter to the above command.
+
+Note that Nyx does **not** support the afl `@@` argument. Instead pass
+something like `-file /foo.file -args "--file /foo.file --other-args"` to
+the above command.
+
+
+Then the final step: we generate the Nyx package configuration:
 
 ```shell
 python3 nyx_mode/packer/packer/nyx_config_gen.py PACKAGE-DIRECTORY Kernel
 ```
 
 ## Fuzzing with Nyx mode
+
+Note that you need to load the kvm kernel modules for Nyx:
+```
+sudo modprobe -r kvm-intel
+sudo modprobe -r kvm
+sudo modprobe  kvm enable_vmware_backdoor=y
+sudo modprobe  kvm-intel
+cat /sys/module/kvm/parameters/enable_vmware_backdoor | grep -q Y && echo OK || echo KVM module problem
+```
 
 All the hard parts are done, fuzzing with Nyx mode is easy - just supply the
 `PACKAGE-DIRECTORY` as fuzzing target and specify the `-X` option to afl-fuzz:
@@ -83,16 +102,8 @@ All the hard parts are done, fuzzing with Nyx mode is easy - just supply the
 afl-fuzz -i in -o out -X -- ./PACKAGE-DIRECTORY
 ```
 
-Most likely your first run will fail because the Linux modules have to be
-specially set up, but afl-fuzz will tell you this on startup and how to rectify
-the situation:
-
-```
-sudo modprobe -r kvm-intel # or kvm-amd for AMD processors
-sudo modprobe -r kvm
-sudo modprobe kvm enable_vmware_backdoor=y
-sudo modprobe kvm-intel # or kvm-amd for AMD processors
-```
+If you get a forkserver error upon starting then you did not load the Linux
+kvm kernel modules, see above.
 
 If you want to fuzz in parallel (and you should!), then this has to be done in a
 special way:
@@ -114,13 +125,39 @@ afl-fuzz -i in -o out -Y -S 1 -- ./PACKAGE-DIRECTORY
 afl-fuzz -i in -o out -Y -S 2 -- ./PACKAGE-DIRECTORY
 ```
 
+
 ## AFL++ companion tools (afl-showmap etc.)
 
-Please note that AFL++ companion tools like afl-cmin, afl-showmap, etc. are
-not supported with Nyx mode, only afl-fuzz.
+AFL++ companion tools support Nyx mode and can be used to analyze or minimize one specific input or an entire output corpus. These tools work similarly to `afl-fuzz`. 
 
-For source based instrumentation just use these tools normally, for
-binary-only targets use with -Q for qemu_mode.
+To run a target with one of these tools, add the `-X` parameter to the command line to enable Nyx mode, and pass the path to a Nyx package directory:
+
+```shell 
+afl-tmin -i in_file -o out_file -X  -- ./PACKAGE-DIRECTORY
+```
+
+```shell 
+afl-analyze -i in_file -X  -- ./PACKAGE-DIRECTORY
+```
+
+```shell 
+afl-showmap -i in_dir -o out_file -X -- ./PACKAGE-DIRECTORY
+```
+
+```shell 
+afl-cmin -i in_dir -o out_dir -X -- ./PACKAGE-DIRECTORY
+```
+
+On each program startup of one the AFL++ tools in Nyx mode, a Nyx VM is spawned, and a bootstrapping procedure is performed inside the VM to prepare the target environment. As a consequence, due to the bootstrapping procedure, the launch performance is much slower compared to other modes. However, this can be optimized by reusing an existing fuzzing snapshot to avoid the slow re-execution of the bootstrap procedure. 
+
+A fuzzing snapshot is automatically created and stored in the output directory at `out_dir/workdir/snapshot/` by the first parent process of `afl-fuzz` if parallel mode is used. To enable this feature, set the path to an existing snapshot directory in the `AFL_NYX_REUSE_SNAPSHOT` environment variable and use the tools as usual:
+
+```shell 
+afl-fuzz -i ./in_dir -o ./out_dir -Y -M 0 ./PACKAGE-DIRECTORY
+
+AFL_NYX_REUSE_SNAPSHOT=./out_dir/workdir/snapshot/ afl-analyze -i in_file -X  -- ./PACKAGE-DIRECTORY
+```
+
 
 ## Real-world examples
 
@@ -149,7 +186,7 @@ make CC=afl-clang-fast CXX=afl-clang-fast++ LD=afl-clang-fast
 
 #### Nyx share directories
 
-Nyx expects that the target is provided in a certain format. More specifically, the target is passed as a so-called „share directory“ to a Nyx-frontend implementation. The share directory contains the target as well as a folder containing all dependencies and other files that are copied over to the guest. But more importantly, this share directory also contains a bootstrap script (`fuzz.sh`if you are using `KVM-Nyx`otherwise `fuzz_no_pt.sh`) that is also executed right after launching the fuzzer. Both bootstrap scripts use several tools to communicate with the "outer world":
+Nyx expects that the target is provided in a certain format. More specifically, the target is passed as a so-called „share directory“ to a Nyx-frontend implementation. The share directory contains the target as well as a folder containing all dependencies and other files that are copied over to the guest. But more importantly, this share directory also contains a bootstrap script (`fuzz.sh`if you are using `KVM-Nyx`otherwise `fuzz_no_pt.sh`) that is also executed right after launching the fuzzer. Either of these scripts can be edited to more fully prepare an environment for the target, like transferring configuration files to the target's filesystem. Both bootstrap scripts use several tools to communicate with the "outer world":
 
 - `hcat` - this tool copies a given string to the host
 - `hget` - this program requests a file from the host's share directory
@@ -274,7 +311,28 @@ command:
 ```
 
 If you want to disable fast snapshots (except for crashes), you can simply set
-the `NYX_DISABLE_SNAPSHOT_MODE` environment variable.
+the `AFL_NYX_DISABLE_SNAPSHOT_MODE` environment variable.
+
+### Nyx crash reports
+
+If the Nyx agent detects a crash in the target application, it can pass 
+additional information on that crash to AFL++ (assuming that the agent
+implements this feature). For each saved crashing input AFL++ will also create
+an additional file in the `crashes` directory with a `.log` file extension.
+Crash reports generated by the default agent shipped with the Nyx packer will
+contain information such as the faulting address and signal number.
+Additionally, if the target is compiled with AddressSanitizer, the crash report
+will also contain the entire ASan report. 
+
+From a technical perspective, the crash report is passed from QEMU-Nyx to AFL++
+via a shared memory region called Nyx Auxiliary Buffer which is by default 4096
+bytes in size. In this shared memory region a specific amount is reserved for
+the header (1408 bytes) and the remaining bytes can be used to transfer crash
+reports (also the `hprintf` feature utilizes the very same shared memory for 
+transferring data). By default a crash report will be truncated to 2688 bytes.
+However, if you want to increase the size of the shared memory region, you can
+set the `AFL_NYX_AUX_SIZE` environment variable to a higher value (keep in
+mind that this value must be a multiple of 4096).
 
 ### Run AFL++Nyx with a custom agent
 

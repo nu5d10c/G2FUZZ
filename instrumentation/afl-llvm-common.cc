@@ -12,6 +12,7 @@
 #include <list>
 #include <string>
 #include <fstream>
+#include <cmath>
 
 #include <llvm/Support/raw_ostream.h>
 
@@ -24,6 +25,51 @@ static std::list<std::string> allowListFiles;
 static std::list<std::string> allowListFunctions;
 static std::list<std::string> denyListFiles;
 static std::list<std::string> denyListFunctions;
+
+unsigned int calcCyclomaticComplexity(llvm::Function *F) {
+
+  unsigned int numBlocks = 0;
+  unsigned int numEdges = 0;
+  unsigned int numCalls = 0;
+
+  // Iterate through each basic block in the function
+  for (BasicBlock &BB : *F) {
+
+    // count all nodes == basic blocks
+    numBlocks++;
+    // Count the number of successors (outgoing edges)
+    for (BasicBlock *Succ : successors(&BB)) {
+
+      // count edges for CC
+      numEdges++;
+      (void)(Succ);
+
+    }
+
+    for (Instruction &I : BB) {
+
+      // every call is also an edge, so we need to count the calls too
+      if (isa<CallInst>(&I) || isa<InvokeInst>(&I)) { numCalls++; }
+
+    }
+
+  }
+
+  // Cyclomatic Complexity V(G) = E - N + 2P
+  // For a single function, P (number of connected components) is 1
+  // Calls are considered to be an edge
+  unsigned int CC = 2 + numCalls + numEdges - numBlocks;
+
+  // if (debug) {
+
+  fprintf(stderr, "CyclomaticComplexity for %s: %u\n",
+          F->getName().str().c_str(), CC);
+
+  //}
+
+  return CC;
+
+}
 
 char *getBBName(const llvm::BasicBlock *BB) {
 
@@ -90,20 +136,28 @@ bool isIgnoreFunction(const llvm::Function *F) {
 
   for (auto const &ignoreListFunc : ignoreList) {
 
+#if LLVM_VERSION_MAJOR >= 19
+    if (F->getName().starts_with(ignoreListFunc)) { return true; }
+#else
     if (F->getName().startswith(ignoreListFunc)) { return true; }
+#endif
 
   }
 
   static constexpr const char *ignoreSubstringList[] = {
 
-      "__asan", "__msan",       "__ubsan",    "__lsan",  "__san", "__sanitize",
-      "__cxx",  "DebugCounter", "DwarfDebug", "DebugLoc"
+      "__asan",     "__msan",       "__ubsan",    "__lsan",  "__san",
+      "__sanitize", "DebugCounter", "DwarfDebug", "DebugLoc"
 
   };
 
+  // This check is very sensitive, we must be sure to not include patterns
+  // that are part of user-written C++ functions like the ones including
+  // std::string as parameter (see #1927) as the mangled type is inserted in the
+  // mangled name of the user-written function
   for (auto const &ignoreListFunc : ignoreSubstringList) {
 
-    // hexcoder: F->getName().contains() not avaiilable in llvm 3.8.0
+    // hexcoder: F->getName().contains() not available in llvm 3.8.0
     if (StringRef::npos != F->getName().find(ignoreListFunc)) { return true; }
 
   }
@@ -113,6 +167,10 @@ bool isIgnoreFunction(const llvm::Function *F) {
 }
 
 void initInstrumentList() {
+
+  static int init = 0;
+  if (init) return;
+  init = 1;
 
   char *allowlist = getenv("AFL_LLVM_ALLOWLIST");
   if (!allowlist) allowlist = getenv("AFL_LLVM_INSTRUMENT_FILE");
@@ -288,6 +346,7 @@ void scanForDangerousFunctions(llvm::Module *M) {
 
     StringRef ifunc_name = IF.getName();
     Constant *r = IF.getResolver();
+    if (r->getNumOperands() == 0) { continue; }
     StringRef r_name = cast<Function>(r->getOperand(0))->getName();
     if (!be_quiet)
       fprintf(stderr,
@@ -582,7 +641,7 @@ bool isInInstrumentList(llvm::Function *F, std::string Filename) {
 }
 
 // Calculate the number of average collisions that would occur if all
-// location IDs would be assigned randomly (like normal afl/afl++).
+// location IDs would be assigned randomly (like normal afl/AFL++).
 // This uses the "balls in bins" algorithm.
 unsigned long long int calculateCollisions(uint32_t edges) {
 

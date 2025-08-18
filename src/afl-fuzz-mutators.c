@@ -5,12 +5,12 @@
    Originally written by Shengtuo Hu
 
    Now maintained by  Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
                         Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -155,7 +155,7 @@ void destroy_custom_mutators(afl_state_t *afl) {
 
     LIST_FOREACH_CLEAR(&afl->custom_mutator_list, struct custom_mutator, {
 
-      if (!el->data) { FATAL("Deintializing NULL mutator"); }
+      if (!el->data) { FATAL("Deinitializing NULL mutator"); }
       if (el->afl_custom_deinit) el->afl_custom_deinit(el->data);
       if (el->dh) dlclose(el->dh);
 
@@ -179,11 +179,19 @@ struct custom_mutator *load_custom_mutator(afl_state_t *afl, const char *fn) {
   void                  *dh;
   struct custom_mutator *mutator = ck_alloc(sizeof(struct custom_mutator));
 
-  mutator->name = fn;
-  if (memchr(fn, '/', strlen(fn)))
-    mutator->name_short = strrchr(fn, '/') + 1;
-  else
+  if (memchr(fn, '/', strlen(fn))) {
+
+    mutator->name_short = strdup(strrchr(fn, '/') + 1);
+
+  } else {
+
     mutator->name_short = strdup(fn);
+
+  }
+
+  if (strlen(mutator->name_short) > 22) { mutator->name_short[21] = 0; }
+
+  mutator->name = fn;
   ACTF("Loading custom mutator library from '%s'...", fn);
 
   dh = dlopen(fn, RTLD_NOW);
@@ -312,12 +320,18 @@ struct custom_mutator *load_custom_mutator(afl_state_t *afl, const char *fn) {
 
   if (notrim) {
 
+    if (mutator->afl_custom_init_trim || mutator->afl_custom_trim ||
+        mutator->afl_custom_post_trim) {
+
+      WARNF(
+          "Custom mutator does not implement all three trim APIs, standard "
+          "trimming will be used.");
+
+    }
+
     mutator->afl_custom_init_trim = NULL;
     mutator->afl_custom_trim = NULL;
     mutator->afl_custom_post_trim = NULL;
-    ACTF(
-        "Custom mutator does not implement all three trim APIs, standard "
-        "trimming will be used.");
 
   }
 
@@ -358,6 +372,19 @@ struct custom_mutator *load_custom_mutator(afl_state_t *afl, const char *fn) {
 
   }
 
+  /* "afl_custom_splice_optout", optional, never called */
+  mutator->afl_custom_splice_optout = dlsym(dh, "afl_custom_splice_optout");
+  if (!mutator->afl_custom_splice_optout) {
+
+    ACTF("optional symbol 'afl_custom_splice_optout' not found.");
+
+  } else {
+
+    OKF("Found 'afl_custom_splice_optout'.");
+    afl->custom_splice_optout = 1;
+
+  }
+
   /* "afl_custom_fuzz_send", optional */
   mutator->afl_custom_fuzz_send = dlsym(dh, "afl_custom_fuzz_send");
   if (!mutator->afl_custom_fuzz_send) {
@@ -367,6 +394,18 @@ struct custom_mutator *load_custom_mutator(afl_state_t *afl, const char *fn) {
   } else {
 
     OKF("Found 'afl_custom_fuzz_send'.");
+
+  }
+
+  /* "afl_custom_post_run", optional */
+  mutator->afl_custom_post_run = dlsym(dh, "afl_custom_post_run");
+  if (!mutator->afl_custom_post_run) {
+
+    ACTF("optional symbol 'afl_custom_post_run' not found.");
+
+  } else {
+
+    OKF("Found 'afl_custom_post_run'.");
 
   }
 
@@ -597,7 +636,7 @@ u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
     q->len = out_len;
 
     memcpy(afl->fsrv.trace_bits, afl->clean_trace_custom, afl->fsrv.map_size);
-    update_bitmap_score(afl, q);
+    update_bitmap_score(afl, q, true);
 
   }
 

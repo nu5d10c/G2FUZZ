@@ -48,6 +48,7 @@ C/C++:
 ```c
 void *afl_custom_init(afl_state_t *afl, unsigned int seed);
 unsigned int afl_custom_fuzz_count(void *data, const unsigned char *buf, size_t buf_size);
+void afl_custom_splice_optout(void *data);
 size_t afl_custom_fuzz(void *data, unsigned char *buf, size_t buf_size, unsigned char **out_buf, unsigned char *add_buf, size_t add_buf_size, size_t max_size);
 const char *afl_custom_describe(void *data, size_t max_description_len);
 size_t afl_custom_post_process(void *data, unsigned char *buf, size_t buf_size, unsigned char **out_buf);
@@ -71,6 +72,9 @@ def init(seed):
 
 def fuzz_count(buf):
     return cnt
+
+def splice_optout():
+    pass
 
 def fuzz(buf, add_buf, max_size):
     return mutated_out
@@ -114,15 +118,16 @@ def deinit():  # optional for Python
 
 ### Custom Mutation
 
-- `init`:
+- `init` (optional in Python):
 
     This method is called when AFL++ starts up and is used to seed RNG and set
     up buffers and state.
 
 - `queue_get` (optional):
 
-    This method determines whether the custom fuzzer should fuzz the current
-    queue entry or not
+    This method determines whether AFL++ should fuzz the current
+    queue entry or not: all defined custom mutators as well as
+    all AFL++'s mutators.
 
 - `fuzz_count` (optional):
 
@@ -132,13 +137,24 @@ def deinit():  # optional for Python
     for a specific queue entry, use this function. This function is most useful
     if `AFL_CUSTOM_MUTATOR_ONLY` is **not** used.
 
+- `splice_optout` (optional):
+
+    If this function is present, no splicing target is passed to the `fuzz`
+    function. This saves time if splicing data is not needed by the custom
+    fuzzing function.
+    This function is never called, just needs to be present to activate.
+
 - `fuzz` (optional):
 
-    This method performs custom mutations on a given input. It also accepts an
-    additional test case. Note that this function is optional - but it makes
-    sense to use it. You would only skip this if `post_process` is used to fix
-    checksums etc. so if you are using it, e.g., as a post processing library.
-    Note that a length > 0 *must* be returned!
+    This method performs your custom mutations on a given input.
+    The add_buf is the contents of another queue item that can be used for
+    splicing - or anything else - and can also be ignored. If you are not
+    using this additional data then define `splice_optout` (see above).
+    This function is optional.
+    Returning a length of 0 is valid and is interpreted as skipping this
+    one mutation result.
+    For non-Python: the returned output buffer is under **your** memory
+    management!
 
 - `describe` (optional):
 
@@ -172,12 +188,22 @@ def deinit():  # optional for Python
     to the target, e.g. if it is too short, too corrupted, etc. If so,
     return a NULL buffer and zero length (or a 0 length string in Python).
 
+    NOTE: Do not make any random changes to the data in this function!
+
+    PERFORMANCE for C/C++: If possible make the changes in-place (so modify
+    the `*data` directly, and return it as `*outbuf = data`.
+
 - `fuzz_send` (optional):
 
     This method can be used if you want to send data to the target yourself,
     e.g. via IPC. This replaces some usage of utils/afl_proxy but requires
     that you start the target with afl-fuzz.
-    Example: [custom_mutators/examples/custom_send.c](custom_mutators/examples/custom_send.c)
+
+    Setting `AFL_CUSTOM_MUTATOR_LATE_SEND` will call the afl_custom_fuzz_send()
+    function after the target has been restarted. (This is needed for e.g. TCP
+    services.)
+
+    Example: [custom_mutators/examples/custom_send.c](../custom_mutators/examples/custom_send.c)
 
 - `queue_new_entry` (optional):
 
@@ -190,7 +216,7 @@ def deinit():  # optional for Python
     discovered if compiled with INTROSPECTION. The custom mutator can then
     return a string (const char *) that reports the exact mutations used.
 
-- `deinit`:
+- `deinit` (optional in Python):
 
     The last method to be called, deinitializing the state.
 
@@ -245,6 +271,11 @@ trimmed input. Here's a quick API description:
 Omitting any of three trimming methods will cause the trimming to be disabled
 and trigger a fallback to the built-in default trimming routine.
 
+**IMPORTANT** If you have a custom post process mutator that needs to be run
+after trimming, you must call it yourself at the end of your successful
+trimming!
+
+
 ### Environment Variables
 
 Optionally, the following environment variables are supported:
@@ -286,6 +317,34 @@ compiles `afl-fuzz` with the feature if available.
 Note: for some distributions, you might also need the package `python[3]-apt`.
 In case your setup is different, set the necessary variables like this:
 `PYTHON_INCLUDE=/path/to/python/include LDFLAGS=-L/path/to/python/lib make`.
+
+### Helpers
+
+For C/C++ custom mutators you get a pointer to `afl_state_t *afl` in the
+`afl_custom_init()` which contains all information that you need.
+Note that if you access it, you need to recompile your custom mutator if
+you update AFL++ because the structure might have changed!
+
+For mutators written in Python, Rust, GO, etc. there are a few environment
+variables set to help you to get started:
+
+`AFL_CUSTOM_INFO_PROGRAM` - the program name of the target that is executed.
+If your custom mutator is used with modes like Qemu (`-Q`), this will still
+contain the target program, not afl-qemu-trace.
+
+`AFL_CUSTOM_INFO_PROGRAM_INPUT` - if the `-f` parameter is used with afl-fuzz
+then this value is found in this environment variable.
+
+`AFL_CUSTOM_INFO_PROGRAM_ARGV` - this contains the parameters given to the
+target program and still has the `@@` identifier in there.
+
+Note: If `AFL_CUSTOM_INFO_PROGRAM_INPUT` is empty and `AFL_CUSTOM_INFO_PROGRAM_ARGV`
+is either empty or does not contain `@@` then the target gets the input via
+`stdin`.
+
+`AFL_CUSTOM_INFO_OUT` - This is the output directory for this fuzzer instance,
+so if `afl-fuzz` was called with `-o out -S foobar`, then this will be set to
+`out/foobar`.
 
 ### Custom Mutator Preparation
 

@@ -390,7 +390,7 @@ Consider the [following](test/js/test2.c) test code...
    --------------------------------------------------------
    Originally written by Michal Zalewski
    Copyright 2014 Google Inc. All rights reserved.
-   Copyright 2019-2023 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
@@ -724,16 +724,16 @@ class Afl {
    * it takes as arguments a `NativePointer` and a `number`. It can be
    * called multiple times to exclude several ranges.
    */
-  static addExcludedRange(addressess, size) {
-      Afl.jsApiAddExcludeRange(addressess, size);
+  static addExcludedRange(addresses, size) {
+      Afl.jsApiAddExcludeRange(addresses, size);
   }
   /**
    * This is equivalent to setting a value in `AFL_FRIDA_INST_RANGES`,
    * it takes as arguments a `NativePointer` and a `number`. It can be
    * called multiple times to include several ranges.
    */
-  static addIncludedRange(addressess, size) {
-      Afl.jsApiAddIncludeRange(addressess, size);
+  static addIncludedRange(addresses, size) {
+      Afl.jsApiAddIncludeRange(addresses, size);
   }
   /**
    * This must always be called at the end of your script. This lets
@@ -771,7 +771,7 @@ class Afl {
   }
   /**
    * Print a message to the STDOUT. This should be preferred to
-   * FRIDA's `console.log` since FRIDA will queue it's log messages.
+   * FRIDA's `console.log` since FRIDA will queue its log messages.
    * If `console.log` is used in a callback in particular, then there
    * may no longer be a thread running to service this queue.
    */
@@ -845,6 +845,12 @@ class Afl {
       Afl.jsApiSetInstrumentLibraries();
   }
   /**
+   * See `AFL_FRIDA_INST_NO_DYNAMIC_LOAD`
+   */
+  static setInstrumentNoDynamicLoad() {
+    Afl.jsApiSetInstrumentNoDynamicLoad();
+  }
+  /**
    * See `AFL_FRIDA_INST_NO_OPTIMIZE`
    */
   static setInstrumentNoOptimize() {
@@ -887,14 +893,14 @@ class Afl {
   }
   /**
    * This is equivalent to setting `AFL_FRIDA_PERSISTENT_ADDR`, again a
-   * `NativePointer` should be provided as it's argument.
+   * `NativePointer` should be provided as its argument.
    */
   static setPersistentAddress(address) {
       Afl.jsApiSetPersistentAddress(address);
   }
   /**
    * This is equivalent to setting `AFL_FRIDA_PERSISTENT_CNT`, a
-   * `number` should be provided as it's argument.
+   * `number` should be provided as its argument.
    */
   static setPersistentCount(count) {
       Afl.jsApiSetPersistentCount(count);
@@ -914,7 +920,7 @@ class Afl {
   }
   /**
    * This is equivalent to setting `AFL_FRIDA_PERSISTENT_RET`, again a
-   * `NativePointer` should be provided as it's argument.
+   * `NativePointer` should be provided as its argument.
    */
   static setPersistentReturn(address) {
       Afl.jsApiSetPersistentReturn(address);
