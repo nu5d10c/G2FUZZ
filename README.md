@@ -3,7 +3,7 @@ Modern software often accepts inputs with highly complex grammars. To conduct gr
 
 This paper presents a novel approach to enabling grammar-aware fuzzing over non-textual inputs. We employ LLMs (e.g., GPT-3.5) to synthesize and further mutate input generators, often in the format of Python scripts, that generate data that conform to the grammar of a given input format. Then, non-textual data yielded by the input generators are further mutated by traditional fuzzers (e.g., AFL++) to explore the software input space more effectively. Holistically, our approach, namely G2FUZZ, features a hybrid strategy that combines a “holistic search” driven by LLMs and a “local search” driven by industrial quality fuzzers. Two key advantages of G2FUZZ are: (1) LLMs are good at synthesizing and mutating input generators and enabling jumping out of local optima, thus achieving a synergistic effect when combined with mutation-based fuzzers; (2) LLMs are less frequently invoked unless really needed, thus significantly reducing the cost of LLM usage. 
 
-The current version is based on AFL++-4.32c.
+We have implemented G2FUZZ on the latest version of AFL++ (AFL++-4.32c).
 
 # How to use it
 ## Step I: Preparation
@@ -27,8 +27,8 @@ Then, you need to set up these three files:
 - `model_setting.json`: The model we used.
 
 ### Compile G2FUZZ and target program
-The compilation method for G2FUZZ is the same as that for AFL++: `make source`.
-The method for compiling the target program is also consistent with AFL++, requiring `program.afl` (the program compiled under the default mode) and `program.cmp` (the program compiled under cmplog mode).
+The compilation method for G2FUZZ is the same as that for AFL++: `make source-only`.
+The method for compiling the target program is also consistent with AFL++, requiring `program.afl` (the program compiled under the `default` mode) and `program.cmp` (the program compiled under `cmplog` mode).
 
 
 ## Step II: Run seed generation to get init output
