@@ -39,7 +39,7 @@ python ./G2FUZZ/program_gen.py --output ./<program_name>_output --program <progr
 
 For example:
 ```
-python ./G2FUZZ/program_gen.py --output ./exiv2_output --program exiv2
+python ./G2FUZZ/program_gen.py --output ./jhead_output --program jhead
 ```
 
 ## Step III: Run fuzzing
@@ -56,7 +56,7 @@ cp -r <program_name>_output/default/gen_seeds initial_seeds
 
 For example:
 ```
-cp -r exiv2_output/default/gen_seeds/* initial_seeds
+cp -r jhead_output/default/gen_seeds/* initial_seeds
 ```
 
 ### 2. Formal fuzzing
@@ -69,7 +69,7 @@ Note that: `./<program_name>_output` is the `--output ./<program_name>_output` i
 
 For example:
 ```
-./G2FUZZ/afl-fuzz -i ./initial_seeds -o ./exiv2_output -c ./exiv2.cmp -m 1024 -k ./G2FUZZ/ -- ./exiv2.afl @@
+./G2FUZZ/afl-fuzz -i ./initial_seeds -o ./jhead_output -c ./jhead.cmp -m 1024 -k ./G2FUZZ/ -- ./jhead.afl @@
 ```
 
 # Contact
