@@ -71,3 +71,7 @@ For example:
 ```
 ./G2FUZZ/afl-fuzz -i ./initial_seeds -o ./exiv2_output -c ./exiv2.cmp -m 1024 -k ./G2FUZZ/ -- ./exiv2.afl @@
 ```
+
+# Contact
+
+If you have any questions or suggestions, feel free to contact me via email: [kzhangcl@connect.ust.hk](mailto:kzhangcl@connect.ust.hk)
