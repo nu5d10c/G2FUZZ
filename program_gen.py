@@ -186,15 +186,12 @@ if __name__ == "__main__":
     with open('program_to_format.json', 'r') as file:
         program_to_format = json.load(file)
 
-    with open('model_setting.json', 'r') as file:
-        model_setting = json.load(file)
-
     if not os.path.exists(args.output):
         os.makedirs(args.output)
         os.makedirs(os.path.join(args.output, "default"))
     output_path = os.path.join(args.output, "default")
 
-    model = model_setting["model"][0]
+    model = LLM_MODEL
     print("model:", model)
 
     tmp_path = os.path.join(output_path, "tmp") # can not be changed

@@ -9,22 +9,20 @@ We have implemented G2FUZZ on the latest version of AFL++ (AFL++-4.32c).
 ## Step I: Preparation
 ### Install the dependency libraries
 ```
-pip install openai==1.63.2
+pip install openai==1.63.2 python-dotenv
 ```
 
 ### prepare the setting files
 ```
 cd evaluation_path
 git clone https://github.com/G2FUZZ/G2FUZZ
-cp ./G2FUZZ/openai_key.txt .
+cp ./G2FUZZ/.env.example .env
 cp ./G2FUZZ/program_to_format.json .
-cp ./G2FUZZ/model_setting.json .
 ```
 
-Then, you need to set up these three files:
-- `openai_key.txt`: The OpenAI key.
+Then, you need to set up these files:
+- `.env`: The LLM configuration. Edit this file to set your `LLM_API_KEY`, and optionally `LLM_BASE_URL` and `LLM_MODEL`.
 - `program_to_format.json`: The target program and its expected input formats.
-- `model_setting.json`: The model we used.
 
 ### Compile G2FUZZ and target program
 The compilation method for G2FUZZ is the same as that for AFL++: `make source-only`.
