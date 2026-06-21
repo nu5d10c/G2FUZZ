@@ -2,7 +2,7 @@
     "exiv2": ["jpg"],
     "gdk-pixbuf-pixdata":["gif", "bmp", "png", "pnm", "ico", "xmp", "ani", "pixdata", "tga"],
     "imginfo":["jpg", "pnm", "png", "mif", "bmp", "ras", "pgx", "ras"],
-    "jhead":["jpg", "xmp"],
+    "jhead":["jpg"],
     "tiffsplit":["tiff"],
     "mp3gain":["mp3"],
     "wav2swf":["wav"],
@@ -10,8 +10,8 @@
     "flvmeta":["flv"],
     "mp42aac":["mp4"],
     "pdftotext":["pdf"],
+    
     "djpeg":["jpg"],
-
     "libpng_read_fuzzer":["png"],
     "sndfile_fuzzer":["raw", "wav", "au", "aiff", "aifc", "mp3", "caf"],
     "tiff_read_rgba_fuzzer":["tiff"],
