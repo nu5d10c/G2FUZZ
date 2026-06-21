@@ -21,7 +21,7 @@ cp ./G2FUZZ/program_to_format.json .
 ```
 
 Then, you need to set up these files:
-- `.env`: The LLM configuration. Edit this file to set your `LLM_API_KEY`, and optionally `LLM_BASE_URL` and `LLM_MODEL`.
+- `.env`: The LLM configuration. Edit this file to set your `OPENAI_API_KEY`, and optionally `OPENAI_BASE_URL` and `LLM_MODEL`.
 - `program_to_format.json`: The target program and its expected input formats.
 
 ### Compile G2FUZZ and target program

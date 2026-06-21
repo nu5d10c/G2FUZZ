@@ -4,15 +4,29 @@ import os
 
 load_dotenv()
 
-LLM_API_KEY = os.environ.get("LLM_API_KEY")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL")
+# OPENAI_API_KEY and OPENAI_BASE_URL are standard env vars recognized by
+# the OpenAI SDK and OpenAI-compatible services.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 
-if not LLM_API_KEY:
-    raise ValueError("LLM_API_KEY is not set. Please set it in your .env file or environment variables.")
+if not OPENAI_API_KEY:
+    raise ValueError(
+        "OPENAI_API_KEY is not set. "
+        "Please set it in your .env file or environment variables."
+    )
+
+
+def _create_client():
+    """Create an OpenAI client using standard environment variables."""
+    kwargs = {}
+    if OPENAI_BASE_URL:
+        kwargs["base_url"] = OPENAI_BASE_URL
+    return OpenAI(api_key=OPENAI_API_KEY, **kwargs)
+
 
 def llm(model, prompt, temperature):
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    client = _create_client()
 
     response = client.chat.completions.create(
         model=model,
@@ -28,7 +42,7 @@ def llm(model, prompt, temperature):
     return response.choices[0].message.content
 
 def llm_messages(model, messages, temperature):
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    client = _create_client()
     response = client.chat.completions.create(
         model=model,
         messages=messages,
